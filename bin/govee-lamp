@@ -504,6 +504,8 @@ class Lamp:
         self.cfg = cfg
         self.devices = [Device(cfg, ip=d["ip"], name=d.get("name"), sku=d.get("sku"))
                         for d in device_list(cfg)]
+        for dev, d in zip(self.devices, device_list(cfg)):
+            dev.device_id = d.get("device_id")
         # Fall back to the legacy single device so a half-written config still lights up.
         if not self.devices and cfg.get("ip"):
             self.devices = [Device(cfg)]
@@ -647,13 +649,13 @@ def _discover_locked(cfg, timeout):
     return found
 
 
-def cloud_control(cfg, capability):
+def cloud_control(cfg, capability, sku=None, device=None):
     key = os.environ.get("GOVEE_API_KEY") or cfg.get("api_key")
-    device = cfg.get("device_id")
+    device = device or cfg.get("device_id")
     if not (key and device):
         return False, "no cloud credentials (GOVEE_API_KEY + device_id)"
     body = json.dumps({"requestId": str(uuid.uuid4()), "payload": {
-        "sku": cfg.get("sku", "H6020"), "device": device,
+        "sku": sku or cfg.get("sku", "H6020"), "device": device,
         "capability": capability}}).encode()
     req = urllib.request.Request(CLOUD_URL, data=body, headers={
         "Content-Type": "application/json", "Govee-API-Key": key})
@@ -1305,6 +1307,139 @@ def active_workspace():
         return None
 
 
+# ---------------------------------------------------------------- scenes
+#
+# The H6020 lamps flatten per-segment colour, and uploading a scene over LAN
+# with the generic A3 framing power-cycles them (their 0x50 scene format wants
+# a model prefix nobody has published). What DOES work (2026-09-30, lamp not
+# stereo-paired) is asking Govee's cloud to play one of the lamp's own scenes,
+# which renders a real multi-colour gradient. So for lamps, lava = the stock
+# scene whose colours sit closest to the workspace's theme colours. The scene
+# colours are measured from the little PNG frames each scene's param carries.
+
+SCENE_CACHE = os.path.expanduser("~/.cache/govee-lamp")
+SCENES_URL = "https://openapi.api.govee.com/router/api/v1/device/scenes"
+LIBRARY_URL = "https://app2.govee.com/appsku/v1/light-effect-libraries?sku=%s"
+
+
+def _png_pixels(b):
+    """Decode an 8-bit RGB PNG (what Govee scene frames are) to pixels."""
+    import struct
+    import zlib
+    w, h = struct.unpack(">II", b[16:24])
+    idat, i = b"", 8
+    while i < len(b):
+        n = struct.unpack(">I", b[i:i + 4])[0]
+        if b[i + 4:i + 8] == b"IDAT":
+            idat += b[i + 8:i + 8 + n]
+        i += 12 + n
+    raw, st = zlib.decompress(idat), w * 3 + 1
+    prev, out = bytearray(w * 3), []
+    for y in range(h):
+        f, line = raw[y * st], bytearray(raw[y * st + 1:(y + 1) * st])
+        for x in range(w * 3):
+            a = line[x - 3] if x >= 3 else 0
+            up = prev[x]
+            c = prev[x - 3] if x >= 3 else 0
+            if f == 1:
+                line[x] = (line[x] + a) & 255
+            elif f == 2:
+                line[x] = (line[x] + up) & 255
+            elif f == 3:
+                line[x] = (line[x] + (a + up) // 2) & 255
+            elif f == 4:
+                p = a + up - c
+                pa, pb, pc = abs(p - a), abs(p - up), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc
+                                      else up if pb <= pc else c)) & 255
+        out += [tuple(line[x:x + 3]) for x in range(0, w * 3, 3)]
+        prev = line
+    return out
+
+
+def _scene_colors(param_b64):
+    """Distinct lit colours drawn in a scene's PNG frames."""
+    b = base64.b64decode(param_b64 or "")
+    cols = set()
+    for m in re.finditer(rb"\x89PNG", b):
+        end = b.find(b"IEND", m.start())
+        if end < 0:
+            continue
+        try:
+            for px in _png_pixels(b[m.start():end + 8]):
+                if max(px) > 40:
+                    cols.add(px)
+        except Exception:  # noqa: BLE001 - one odd frame must not sink the catalog
+            continue
+    return [rgb_hex(c) for c in sorted(cols)][:16]
+
+
+def scene_catalog(cfg, sku, device):
+    """[{name, value, colors}] for a SKU, cached on disk for a week."""
+    path = os.path.join(SCENE_CACHE, "scenes-%s.json" % sku)
+    try:
+        if time.time() - os.path.getmtime(path) < 7 * 86400:
+            with open(path) as fh:
+                return json.load(fh)
+    except OSError:
+        pass
+    key = os.environ.get("GOVEE_API_KEY") or cfg.get("api_key")
+    if not (key and device):
+        return []
+    try:
+        body = json.dumps({"requestId": str(uuid.uuid4()),
+                           "payload": {"sku": sku, "device": device}}).encode()
+        req = urllib.request.Request(SCENES_URL, data=body, headers={
+            "Content-Type": "application/json", "Govee-API-Key": key})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            opts = json.load(resp)["payload"]["capabilities"][0]["parameters"]["options"]
+        req = urllib.request.Request(LIBRARY_URL % sku, headers={
+            "AppVersion": "6.5.0", "User-Agent": "GoveeHome/6.5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            lib = json.load(resp)
+    except Exception as exc:  # noqa: BLE001
+        print("scene catalog unavailable: %s" % exc, file=sys.stderr)
+        return []
+    params = {}
+    for cat in lib.get("data", {}).get("categories", []):
+        for sc in cat.get("scenes", []):
+            for fx in sc.get("lightEffects", []):
+                params[fx.get("scenceParamId")] = fx.get("scenceParam")
+    out = []
+    for o in opts:
+        cols = _scene_colors(params.get(o["value"].get("paramId")))
+        if cols:
+            out.append({"name": o["name"], "value": o["value"], "colors": cols})
+    os.makedirs(SCENE_CACHE, exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(out, fh)
+    return out
+
+
+def pick_scene(catalog, want):
+    """The scene whose colours best cover the wanted ones, and stray least."""
+    import colorsys
+
+    def hsv(c):
+        return colorsys.rgb_to_hsv(*(v / 255.0 for v in c))
+
+    def d(a, b):
+        ha, sa, _ = hsv(a)
+        hb, sb, _ = hsv(b)
+        dh = abs(ha - hb)
+        return min(dh, 1 - dh) + 0.3 * abs(sa - sb)
+
+    best, score = None, None
+    for sc in catalog:
+        cols = [hex_rgb(h) for h in sc["colors"]]
+        cover = sum(min(d(w, c) for c in cols) for w in want) / len(want)
+        stray = sum(min(d(c, w) for w in want) for c in cols) / len(cols)
+        s = cover + stray
+        if score is None or s < score:
+            best, score = sc, s
+    return best
+
+
 def _lava_at(cols, x):
     """Smooth closed loop through cols; x wraps at 1.0 (cosine eased)."""
     n = len(cols)
@@ -1384,7 +1519,7 @@ def lava_frame(lamp, sets, t, period):
                         2 * math.pi * (x * 1.5 - t / (period * 0.6)) + tower * 2.1)
                     frame.append(scale(c, blob))
                 d.segment_colors(frame)
-            else:
+            elif not getattr(d, "scene", None):
                 d.color(at(roll + phase))
         except OSError:
             pass
@@ -1421,6 +1556,7 @@ def cmd_workspace(cfg, args):
             return
         if lava:
             new = lava_set(cols, ws)
+            scene_lamps(new)
             cur = anim["sets"][-1][1] if anim["sets"] else None
             anim["from"] = cur if cur and not force else None
             anim["to"] = new
@@ -1429,6 +1565,26 @@ def cmd_workspace(cfg, args):
             return
         rgb = cols[(ws - 1) % len(cols)]
         lamp.fade(rgb, ms)
+
+    use_scenes = lava and bool(cfg.get("lamp_scenes", True))
+
+    def scene_lamps(want):
+        """Put each single-colour unit in the stock scene nearest the set."""
+        if not use_scenes:
+            return
+        import threading
+        for d in lamp.devices:
+            if d.segments or not getattr(d, "device_id", None):
+                continue
+            cat = scene_catalog(cfg, d.sku, d.device_id)
+            sc = pick_scene(cat, want) if cat else None
+            if not sc or getattr(d, "scene", None) == sc["name"]:
+                continue
+            d.scene = sc["name"]
+            threading.Thread(target=cloud_control, daemon=True, args=(cfg, {
+                "type": "devices.capabilities.dynamic_scene",
+                "instance": "lightScene", "value": sc["value"]}),
+                kwargs={"sku": d.sku, "device": d.device_id}).start()
 
     def tick():
         if not lava or "to" not in anim:
