@@ -1664,7 +1664,9 @@ def cmd_lava(cfg, args):
                     scene_lamps_to(cfg, sub, cur)
         k = min(1.0, (time.time() - switched) / 1.5)
         sets = [(1 - k, prev), (k, cur)] if prev and k < 1.0 else [(1.0, cur)]
-        lava_frame(lamp, sets, time.time() - t0, period)
+        roll = bool(cfg.get("bar_roll", False))
+        lava_frame(lamp, sets, time.time() - t0, period, cfg_roll=roll,
+                   bars_set=None if roll else theme_lava_set(distinct_colors(), 6))
         time.sleep(1.0 / fps)
 
 
@@ -1712,7 +1714,7 @@ def _vivid(rgb, min_s=0.85):
     return (r * 255, g * 255, b * 255)
 
 
-def lava_frame(lamp, sets, t, period):
+def lava_frame(lamp, sets, t, period, cfg_roll=True, bars_set=None):
     """Paint one frame of the rolling gradient.
 
     Segmented units get a diagonal band that rolls along their segments with a
@@ -1738,6 +1740,29 @@ def lava_frame(lamp, sets, t, period):
                 # bright/dim wave over it so blobs read as motion even when a
                 # theme's colours are close in hue.
                 per = max(1, n // 2)
+                if not cfg_roll:
+                    # Each tower one solid theme colour, the two always
+                    # different, stepping through the theme every HOLD
+                    # seconds with a short fade. A whole tower is one masked
+                    # packet, so a frame is two datagrams, not twelve.
+                    band = bars_set or [c for _, cs in sets for c in cs]
+                    k = len(band)
+                    HOLD, FADE = 4.0, 1.0
+                    step, into = divmod(t, HOLD)
+                    step = int(step)
+                    f = min(1.0, into / FADE)
+                    for tower in range(2):
+                        off = tower * max(1, k // 2)
+                        c = lerp(band[(step - 1 + off) % k], band[(step + off) % k], f)
+                        c = tuple(int(max(0, min(255, v))) for v in c)
+                        if getattr(d, "_tower_last", {}).get(tower) == c:
+                            continue
+                        mask = ((1 << per) - 1) << (tower * per)
+                        d.ptreal([0x33, 0x05, 0x15, 0x01, c[0], c[1], c[2],
+                                  0, 0, 0, 0, 0, mask & 0xFF, (mask >> 8) & 0xFF])
+                        d.__dict__.setdefault("_tower_last", {})[tower] = c
+                    d._last_rgb = None
+                    continue
                 frame = []
                 for i in range(n):
                     x = (i % per) / per
