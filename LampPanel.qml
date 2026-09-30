@@ -36,6 +36,8 @@ Panel {
   readonly property var modeInfo: ({
     "theme":     { "title": "Theme",     "blurb": "Rest on the theme's accent colour." },
     "ambient":   { "title": "Ambient",   "blurb": "Fade continuously around the theme's whole palette." },
+    "lava":      { "title": "Lava",      "blurb": "Lamps play the scene nearest the theme; the bars roll its colours." },
+    "mix":       { "title": "Mix",       "blurb": "Every light wears a different theme colour, together." },
     "workspace": { "title": "Workspace", "blurb": "Every workspace gets its own colour from the theme." },
     "circadian": { "title": "Circadian", "blurb": "Follow the sun. Cool at midday, warm and dim after dark." },
     "weather":   { "title": "Weather",   "blurb": "Outside temperature, dimmed by cloud cover." },

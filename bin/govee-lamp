@@ -1223,7 +1223,7 @@ def cmd_flash(cfg, args):
 # ---------------------------------------------------------------- modes
 
 
-MODES = ("theme", "mix", "ambient", "workspace", "circadian", "weather",
+MODES = ("theme", "lava", "mix", "ambient", "workspace", "circadian", "weather",
          "events", "music", "gauge", "off")
 UNIT = "govee-lamp.service"
 
@@ -1269,6 +1269,7 @@ def cmd_run(cfg, args):
     handler = {
         "mix": cmd_mix_mode,
         "ambient": cmd_ambient, "workspace": cmd_workspace,
+        "lava": cmd_lava,
         "circadian": cmd_circadian,
         "weather": cmd_weather, "events": cmd_events,
         "music": cmd_music, "gauge": cmd_status_fx,
@@ -1440,6 +1441,233 @@ def pick_scene(catalog, want):
     return best
 
 
+def _png_filters(b):
+    """Per-row PNG filter types of an encoded frame."""
+    import struct
+    import zlib
+    w, h = struct.unpack(">II", b[16:24])
+    idat, i = b"", 8
+    while i < len(b):
+        n = struct.unpack(">I", b[i:i + 4])[0]
+        if b[i + 4:i + 8] == b"IDAT":
+            idat += b[i + 8:i + 8 + n]
+        i += 12 + n
+    raw = zlib.decompress(idat)
+    return [raw[y * (w * 3 + 1)] for y in range(h)]
+
+
+def _png_encode(w, h, pixels, filters=None):
+    """Encode exactly as Govee's own frames are, or the lamp renders nothing.
+
+    Reproduced byte-for-byte from the stock Aurora frames (2026-09-30): zlib
+    level 1, 1 KB window, memLevel 2, rows filtered None or Sub. A default
+    zlib stream plays dark (or reboots the lamp).
+    """
+    import struct
+    import zlib
+    rows, prev = [], bytes(w * 3)
+    for y in range(h):
+        cur = bytes(v for px in pixels[y * w:(y + 1) * w] for v in px)
+        f = filters[y] if filters and y < len(filters) else 0
+        out = bytearray(len(cur))
+        for x in range(len(cur)):
+            a = cur[x - 3] if x >= 3 else 0
+            up = prev[x]
+            c = prev[x - 3] if x >= 3 else 0
+            if f == 1:
+                pred = a
+            elif f == 2:
+                pred = up
+            elif f == 3:
+                pred = (a + up) // 2
+            elif f == 4:
+                p_ = a + up - c
+                pa, pb, pc = abs(p_ - a), abs(p_ - up), abs(p_ - c)
+                pred = a if pa <= pb and pa <= pc else up if pb <= pc else c
+            else:
+                pred = 0
+            out[x] = (cur[x] - pred) & 255
+        rows.append(bytes([f if f in (1, 2, 3, 4) else 0]) + bytes(out))
+        prev = cur
+    z = zlib.compressobj(1, zlib.DEFLATED, 10, 2)
+    data = z.compress(b"".join(rows)) + z.flush()
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", data) + chunk(b"IEND", b""))
+
+
+def _library_scene(sku, name):
+    """(sceneCode, param bytes) for a stock scene, cached on disk."""
+    path = os.path.join(SCENE_CACHE, "library-%s.json" % sku)
+    lib = None
+    try:
+        with open(path) as fh:
+            lib = json.load(fh)
+    except (OSError, ValueError):
+        req = urllib.request.Request(LIBRARY_URL % sku, headers={
+            "AppVersion": "6.5.0", "User-Agent": "GoveeHome/6.5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            lib = json.load(resp)
+        os.makedirs(SCENE_CACHE, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(lib, fh)
+    for cat in lib.get("data", {}).get("categories", []):
+        for sc in cat.get("scenes", []):
+            if sc.get("sceneName") == name and sc.get("lightEffects"):
+                fx = sc["lightEffects"][0]
+                return fx["sceneCode"], base64.b64decode(fx["scenceParam"])
+    return None, None
+
+
+# H6020 scene framing -- UNVERIFIED. The library param starts with a 0x50
+# type byte; swapping it for 0x58 0x5a (AlgoClaw's rule for the sibling H6022)
+# appeared to play Aurora once, but later runs, even of the stock bytes, came
+# out dim, so that "hit" may have been a scene already running. The generic
+# 0x02 prefix power-cycles the lamp. Needs a capture of the app to settle.
+SCENE_PREFIX = {"H6020": (b"\x50", b"\x58\x5a"), "H6022": (b"\x41", b"\x58\x5a")}
+
+
+def theme_scene_packets(sku, colours, base="Aurora"):
+    """A stock matrix scene with every layer recoloured to `colours`.
+
+    The H6020 scene param is a header, then per layer: block length, a flag,
+    PNG length, a 21x11 RGB PNG of the lamp's LED matrix, and 8 bytes of
+    timing. Recolouring the lit pixels keeps Govee's motion with our palette.
+    """
+    import struct
+    rule = SCENE_PREFIX.get((sku or "").upper())
+    if not rule:
+        return None
+    code, b = _library_scene(sku, base)
+    if not b or not b.startswith(rule[0]):
+        return None
+    cnt, out, i = b[10], bytearray(b[:11]), 11
+    for n in range(cnt):
+        flag = b[i + 2]
+        plen = b[i + 3] | b[i + 4] << 8
+        png = b[i + 5:i + 5 + plen]
+        tail = b[i + 5 + plen:i + 13 + plen]
+        w, h = struct.unpack(">II", png[16:24])
+        px = _png_pixels(png)
+        if colours:
+            # Keep Govee's own pattern, swap its colour. Generated frames
+            # (full gradients, tiled bands) played dim or dark; recoloured
+            # stock frames play bright.
+            col = tuple(int(c) for c in colours[n % len(colours)])
+            px = [col if max(p) > 0 else p for p in px]
+        new = _png_encode(w, h, px, _png_filters(png))
+        out += struct.pack("<H", len(new) + 11) + bytes([flag]) \
+            + struct.pack("<H", len(new)) + new + tail
+        i += 13 + plen
+    out += b[i:]
+    struct.pack_into("<H", out, 1, len(out) - 3)
+    param = rule[1] + bytes(out[len(rule[0]):])
+    raw, lines, last = [0xA3, 0x00, 0x01, 0x00], 0, 1
+    for byte in param:
+        if len(raw) % 19 == 0:
+            lines += 1
+            raw.append(0xA3)
+            last = len(raw)
+            raw.append(lines)
+        raw.append(byte)
+    raw[last] = 0xFF
+    raw[3] = lines + 1
+    pkts = [raw[j:j + 19] for j in range(0, len(raw), 19)]
+    pkts.append([0x33, 0x05, 0x04, code & 0xFF, (code >> 8) & 0xFF])
+    return pkts
+
+
+def scene_lamps_to(cfg, lamp, want):
+    """Put each single-colour unit in the stock scene nearest `want`."""
+    import threading
+    for d in lamp.devices:
+        if d.segments or not getattr(d, "device_id", None):
+            continue
+        cat = scene_catalog(cfg, d.sku, d.device_id)
+        sc = pick_scene(cat, want) if cat else None
+        if not sc or getattr(d, "scene", None) == sc["name"]:
+            continue
+        d.scene = sc["name"]
+        threading.Thread(target=cloud_control, daemon=True, args=(cfg, {
+            "type": "devices.capabilities.dynamic_scene",
+            "instance": "lightScene", "value": sc["value"]}),
+            kwargs={"sku": d.sku, "device": d.device_id}).start()
+
+
+def theme_lava_set(cols, k=4):
+    """Up to k theme colours, vivid, spread as far apart in hue as it has.
+
+    Starts from the theme's first (accent) colour so the set is stable for a
+    theme, then adds whichever colour is furthest from those already chosen.
+    """
+    import colorsys
+    viv = [_vivid(c) for c in cols]
+    hue = [colorsys.rgb_to_hsv(*(v / 255.0 for v in c))[0] for c in viv]
+
+    def dist(a, b):
+        d = abs(hue[a] - hue[b])
+        return min(d, 1 - d)
+
+    pick = [0]
+    while len(pick) < min(k, len(viv)):
+        pick.append(max((i for i in range(len(viv)) if i not in pick),
+                        key=lambda i: min(dist(i, j) for j in pick)))
+    return [viv[i] for i in pick]
+
+
+def cmd_lava(cfg, args):
+    """The whole fleet rolls the theme's colours; a theme switch recolours it.
+
+    Light bars roll a lava gradient over their segments (LAN); the lamps play
+    the Govee scene whose colours best match the theme (cloud, one call per
+    theme change). Workspaces play no part.
+    """
+    claim()
+    lamp = Lamp(cfg)
+    period = max(4.0, _num(cfg.get("lava_period", 12), 12))
+    fps = 8.0
+    stamp, cur, prev, switched = None, None, None, 0.0
+    t0 = time.time()
+    while True:
+        if theme_stamp() != stamp:
+            stamp = theme_stamp()
+            prev, cur = cur, theme_lava_set(distinct_colors())
+            switched = time.time()
+            if cfg.get("lamp_scenes", True):
+                # Real theme colours on the matrix lamps over LAN; any unit we
+                # cannot build a scene for falls back to the nearest stock one.
+                rest = []
+                for d in lamp.devices:
+                    if d.segments:
+                        continue
+                    # Experimental: our own theme-coloured scene over LAN.
+                    # Unproven on the real lamps (2026-09-30: results dim or
+                    # dark), so off unless "lamp_theme_scene": true.
+                    pk = None
+                    if cfg.get("lamp_theme_scene", False):
+                        try:
+                            pk = theme_scene_packets(d.sku, cur)
+                        except Exception as exc:  # noqa: BLE001
+                            print("theme scene failed: %s" % exc, file=sys.stderr)
+                    if pk:
+                        d.power(True)
+                        d.ptreal(*pk)
+                        d.scene = "theme"
+                    else:
+                        rest.append(d)
+                if rest:
+                    sub = Lamp.__new__(Lamp)
+                    sub.cfg, sub.devices = cfg, rest
+                    scene_lamps_to(cfg, sub, cur)
+        k = min(1.0, (time.time() - switched) / 1.5)
+        sets = [(1 - k, prev), (k, cur)] if prev and k < 1.0 else [(1.0, cur)]
+        lava_frame(lamp, sets, time.time() - t0, period)
+        time.sleep(1.0 / fps)
+
+
 def _lava_at(cols, x):
     """Smooth closed loop through cols; x wraps at 1.0 (cosine eased)."""
     n = len(cols)
@@ -1545,7 +1773,7 @@ def cmd_workspace(cfg, args):
     # Lava: roll each unit through the workspace's theme colours instead of
     # resting on one. On by default; "workspace_lava": false restores the
     # plain one-colour-per-workspace behaviour.
-    lava = bool(cfg.get("workspace_lava", True))
+    lava = bool(cfg.get("workspace_lava", False))
     period = max(4.0, _num(cfg.get("lava_period", 12), 12))
     fps = 8.0
     anim = {"sets": [], "from": None, "switched": 0.0}
@@ -1569,22 +1797,8 @@ def cmd_workspace(cfg, args):
     use_scenes = lava and bool(cfg.get("lamp_scenes", True))
 
     def scene_lamps(want):
-        """Put each single-colour unit in the stock scene nearest the set."""
-        if not use_scenes:
-            return
-        import threading
-        for d in lamp.devices:
-            if d.segments or not getattr(d, "device_id", None):
-                continue
-            cat = scene_catalog(cfg, d.sku, d.device_id)
-            sc = pick_scene(cat, want) if cat else None
-            if not sc or getattr(d, "scene", None) == sc["name"]:
-                continue
-            d.scene = sc["name"]
-            threading.Thread(target=cloud_control, daemon=True, args=(cfg, {
-                "type": "devices.capabilities.dynamic_scene",
-                "instance": "lightScene", "value": sc["value"]}),
-                kwargs={"sku": d.sku, "device": d.device_id}).start()
+        if use_scenes:
+            scene_lamps_to(cfg, lamp, want)
 
     def tick():
         if not lava or "to" not in anim:
