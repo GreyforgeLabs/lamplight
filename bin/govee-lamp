@@ -366,6 +366,39 @@ class Device:
     def power(self, on):
         self._send({"msg": {"cmd": "turn", "data": {"value": 1 if on else 0}}})
 
+    # Units that really render per-segment colour over ptReal. The H6020 lamp
+    # accepts 0x33 05 15 and flattens it to one colour; the H6056 light bars
+    # paint each segment (split-tested by eye 2026-09-30). Extra mask bits past
+    # a unit's real segment count are ignored, so 12 is a safe ceiling.
+    SEGMENTED = {"H6056": 12}
+
+    @property
+    def segments(self):
+        return self.SEGMENTED.get((self.sku or "").upper(), 0)
+
+    def segment_colors(self, rgbs, min_delta=10):
+        """One colour per segment, one ptReal datagram per segment.
+
+        The H6056 drops a datagram carrying several segment packets (the bars
+        went solid white), but takes them one per datagram. Sends are paced by
+        MAX_HZ, so segments that have barely moved are skipped to keep a frame
+        short and the roll smooth.
+        """
+        last = getattr(self, "_seg_last", None) or [None] * len(rgbs)
+        for i, rgb in enumerate(rgbs):
+            rgb = tuple(int(max(0, min(255, c))) for c in rgb)
+            prev = last[i] if i < len(last) else None
+            if prev and max(abs(a - b) for a, b in zip(prev, rgb)) < min_delta:
+                continue
+            mask = 1 << i
+            self.ptreal([0x33, 0x05, 0x15, 0x01, rgb[0], rgb[1], rgb[2],
+                         0, 0, 0, 0, 0, mask & 0xFF, (mask >> 8) & 0xFF])
+            if i < len(last):
+                last[i] = rgb
+        self._seg_last = last
+        # Whole-unit colour is now stale; the next color() must really send.
+        self._last_rgb = None
+
     def ptreal(self, *packets):
         """Tunnel raw 20-byte Govee BLE packets over the LAN API.
 
@@ -1272,6 +1305,91 @@ def active_workspace():
         return None
 
 
+def _lava_at(cols, x):
+    """Smooth closed loop through cols; x wraps at 1.0 (cosine eased)."""
+    n = len(cols)
+    x = (x % 1.0) * n
+    i = int(x) % n
+    t = x - int(x)
+    t = (1 - math.cos(t * math.pi)) / 2
+    return lerp(cols[i], cols[(i + 1) % n], t)
+
+
+def lava_set(cols, ws):
+    """The workspace's own colour first, then its palette neighbours."""
+    # Spread across the palette, not its neighbours: adjacent entries in a
+    # theme are often near-twins, and a loop of twins reads as a still light.
+    import colorsys
+    viv = [_vivid(c) for c in cols]
+    hue = [colorsys.rgb_to_hsv(*(v / 255.0 for v in c))[0] for c in viv]
+
+    def dist(a, b):
+        d = abs(hue[a] - hue[b])
+        return min(d, 1 - d)
+
+    # The workspace's own colour, then whichever theme colours sit furthest
+    # from it on the wheel. The bars diffuse neighbouring segments together,
+    # so near hues (a blue beside an aqua) blur into one flat light.
+    pick = [(ws - 1) % len(viv)]
+    while len(pick) < min(3, len(viv)):
+        pick.append(max((i for i in range(len(viv)) if i not in pick),
+                        key=lambda i: min(dist(i, j) for j in pick)))
+    return [viv[i] for i in pick]
+
+
+def _vivid(rgb, min_s=0.85):
+    """Keep the theme's hue, lift saturation and value for LEDs.
+
+    Theme palettes are tuned for screens; pastels like #cddbf4 render as
+    plain white on a diffused LED bar, so a pastel gradient looks solid.
+    """
+    import colorsys
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255.0 for c in rgb))
+    r, g, b = colorsys.hsv_to_rgb(h, max(s, min_s), 1.0)
+    return (r * 255, g * 255, b * 255)
+
+
+def lava_frame(lamp, sets, t, period):
+    """Paint one frame of the rolling gradient.
+
+    Segmented units get a diagonal band that rolls along their segments with a
+    slow wobble, like the lamp's own gradient scenes; single-colour units flow
+    through the same loop, each one a phase apart so the fleet never moves in
+    lockstep. `sets` is [(weight, colours)] so a workspace switch crossfades.
+    """
+    def at(x):
+        out = (0.0, 0.0, 0.0)
+        for w, cs in sets:
+            c = _lava_at(cs, x)
+            out = tuple(o + w * v for o, v in zip(out, c))
+        return out
+
+    roll = t / period
+    for idx, d in enumerate(lamp.devices):
+        phase = idx * 0.37
+        try:
+            n = d.segments
+            if n:
+                # The H6056 is two towers of n/2 segments; give each tower the
+                # whole colour loop so the band is visible on both, and ride a
+                # bright/dim wave over it so blobs read as motion even when a
+                # theme's colours are close in hue.
+                per = max(1, n // 2)
+                frame = []
+                for i in range(n):
+                    x = (i % per) / per
+                    tower = i // per
+                    c = at(roll + phase + tower * 0.5 + x)
+                    blob = 0.4 + 0.6 * math.sin(
+                        2 * math.pi * (x * 1.5 - t / (period * 0.6)) + tower * 2.1)
+                    frame.append(scale(c, blob))
+                d.segment_colors(frame)
+            else:
+                d.color(at(roll + phase))
+        except OSError:
+            pass
+
+
 def cmd_workspace(cfg, args):
     """Give every workspace its own colour from the theme.
 
@@ -1289,11 +1407,39 @@ def cmd_workspace(cfg, args):
     stamp = theme_stamp()
     last_ws = None
 
+    # Lava: roll each unit through the workspace's theme colours instead of
+    # resting on one. On by default; "workspace_lava": false restores the
+    # plain one-colour-per-workspace behaviour.
+    lava = bool(cfg.get("workspace_lava", True))
+    period = max(4.0, _num(cfg.get("lava_period", 12), 12))
+    fps = 8.0
+    anim = {"sets": [], "from": None, "switched": 0.0}
+    t0 = time.time()
+
     def paint(ws, force=False):
         if ws is None:
             return
+        if lava:
+            new = lava_set(cols, ws)
+            cur = anim["sets"][-1][1] if anim["sets"] else None
+            anim["from"] = cur if cur and not force else None
+            anim["to"] = new
+            anim["switched"] = time.time()
+            tick()
+            return
         rgb = cols[(ws - 1) % len(cols)]
         lamp.fade(rgb, ms)
+
+    def tick():
+        if not lava or "to" not in anim:
+            return
+        now = time.time()
+        k = min(1.0, (now - anim["switched"]) / max(0.05, ms / 1000.0 * 2))
+        if anim["from"] and k < 1.0:
+            anim["sets"] = [(1 - k, anim["from"]), (k, anim["to"])]
+        else:
+            anim["sets"] = [(1.0, anim["to"])]
+        lava_frame(lamp, anim["sets"], now - t0, period)
 
     sock_path = hypr_socket()
     if not sock_path:
@@ -1304,7 +1450,7 @@ def cmd_workspace(cfg, args):
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(sock_path)
-            sock.settimeout(1.0)
+            sock.settimeout(1.0 / fps if lava else 1.0)
         except OSError:
             time.sleep(3)
             sock_path = hypr_socket() or sock_path
@@ -1326,10 +1472,12 @@ def cmd_workspace(cfg, args):
                 try:
                     chunk = sock.recv(8192).decode("utf-8", "replace")
                 except socket.timeout:
+                    tick()
                     continue
                 if not chunk:
                     break
                 buf += chunk
+                tick()
                 while "\n" in buf:
                     line, _, buf = buf.partition("\n")
                     name, _, payload = line.partition(">>")
