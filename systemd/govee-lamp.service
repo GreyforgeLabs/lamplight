@@ -1,0 +1,20 @@
+[Unit]
+Description=Govee Office Light effect
+Documentation=file:///home/pi/Projects/lamplight.omarchy/README.md
+# Deliberately NOT Wants/After=graphical-session.target: a user unit that wants
+# it races uwsm at login and can leave the session with no GUI at all.
+
+[Service]
+Type=simple
+# Dispatches on "mode" in ~/.config/govee-lamp.json, so the bar plugin, the CLI
+# and a reboot all agree on one source of truth.
+ExecStart=/home/pi/bin/govee-lamp run
+# on-failure, not always: running an effect by hand SIGTERMs this one, which
+# exits 0. With Restart=always systemd would relaunch it and the two would
+# fight over the lamp at 20 Hz.
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=0
+
+[Install]
+WantedBy=default.target

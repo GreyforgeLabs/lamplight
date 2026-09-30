@@ -1,0 +1,1794 @@
+#!/usr/bin/env python3
+"""Drive the Govee Table Lamp 2 Pro x Sound by JBL (H6020) from Omarchy.
+
+Transport is the Govee LAN API: plain UDP, no cloud, no account, no latency.
+Commands go to the lamp on port 4003; the lamp answers on our port 4002.
+
+Two things must be true or the lamp looks dead:
+  * LAN Control is ON for the device in the Govee Home app.
+  * ufw lets replies in:
+      ufw allow from 10.0.0.0/24 to any port 4002 proto udp
+
+The lamp renders ONE colour at a time -- per-segment writes (0x33 05 15) are
+accepted and then flattened -- so every effect here is animated from this host.
+Measured on the real lamp: it tracks 20 updates/sec with no drops, which is
+plenty for smooth fades.
+
+Python + stdlib (numpy only for the music FFT) on purpose: this is the sibling
+of omarchy-kbd-rgb, which does the same job for the keyboard, reads the same
+palette and is fired by the same theme-set hook.
+"""
+
+import base64
+import fcntl
+import json
+import math
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+import urllib.request
+
+CONFIG = os.path.expanduser("~/.config/govee-lamp.json")
+THEME_DIR = os.path.expanduser("~/.local/state/omarchy/current/theme")
+STATE_DIR = os.path.expanduser("~/.local/state/govee-lamp")
+PIDFILE = os.path.join(STATE_DIR, "daemon.pid")
+
+MULTICAST = "239.255.255.250"
+SCAN_PORT, RECV_PORT, SEND_PORT = 4001, 4002, 4003
+CLOUD_URL = "https://openapi.api.govee.com/router/api/v1/device/control"
+
+HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
+MAX_HZ = 20.0
+
+# One full lap of the theme palette, in seconds. The plugin exposes this range.
+AMBIENT_CYCLE_DEFAULT = 15.0
+AMBIENT_CYCLE_MIN = 5.0
+AMBIENT_CYCLE_MAX = 60.0
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config():
+    try:
+        with open(CONFIG) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def cfg_value(cfg, key, fallback):
+    """Read one key straight off disk.
+
+    A long-running effect must see a slider move without being restarted, and
+    re-reading one small JSON file once per lap is cheaper than any watcher.
+    """
+    try:
+        with open(CONFIG) as fh:
+            return float(json.load(fh).get(key, fallback))
+    except (OSError, ValueError, TypeError):
+        return float(cfg.get(key, fallback))
+
+
+def save_config(cfg):
+    # Written via a temp file and renamed: the bar polls this file every few
+    # seconds and every action triggers another read 900ms later, so an
+    # in-place truncate is reliably caught mid-write and the bar blanks.
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, CONFIG)
+
+
+# ---------------------------------------------------------------- colour
+
+
+def _num(value, default):
+    """Config and CLI flags are user-writable; a bad one must not traceback."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def hex_rgb(s):
+    s = s.lstrip("#")
+    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+
+
+def rgb_hex(rgb):
+    return "#%02x%02x%02x" % tuple(int(max(0, min(255, c))) for c in rgb)
+
+
+def lerp(a, b, t):
+    """Blend two colours in linear light.
+
+    Interpolating raw sRGB drags mid-fades through a muddy grey; squaring into
+    linear light and back keeps a red->blue fade looking like light mixing.
+    """
+    out = []
+    for ca, cb in zip(a, b):
+        la, lb = (ca / 255.0) ** 2.2, (cb / 255.0) ** 2.2
+        out.append(int(round((((1 - t) * la + t * lb) ** (1 / 2.2)) * 255)))
+    return tuple(out)
+
+
+def scale(rgb, f):
+    return tuple(int(max(0, min(255, c * f))) for c in rgb)
+
+
+def hsv_rgb(h, s, v):
+    i = int(h * 6.0) % 6
+    f = h * 6.0 - int(h * 6.0)
+    p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    r, g, b = [(v, t, p), (q, v, p), (p, v, t),
+               (p, q, v), (t, p, v), (v, p, q)][i]
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+# ---------------------------------------------------------------- theme
+
+
+def load_palette():
+    """Read the active Omarchy theme's colors.toml into {name: (r,g,b)}."""
+    palette = {}
+    try:
+        for line in open(os.path.join(THEME_DIR, "colors.toml")):
+            line = line.strip()
+            if "=" not in line or line.startswith("#"):
+                continue
+            key, _, val = line.partition("=")
+            val = val.strip().strip('"').strip("'")
+            # Validate before parsing. hex_rgb() raises ValueError on bad
+            # digits, and load_palette() sits under every effect, `json` and
+            # `status`, so one bad theme line would otherwise traceback
+            # everything and crash-loop the systemd unit every 15s.
+            if HEX_RE.fullmatch(val):
+                palette[key.strip()] = hex_rgb(val)
+    except OSError:
+        pass
+    return palette
+
+
+PREFERRED = ("accent", "blue", "magenta", "cyan", "green", "yellow", "orange", "red")
+
+
+def theme_colors():
+    """The theme's vivid colours, brightest-intent first, de-duplicated.
+
+    Same rule as omarchy-kbd-rgb's theme_colors(), so the lamp and the KB7
+    keyboard always draw from the same set. Near-black entries are dropped:
+    on a lamp they read as 'off' rather than as a colour.
+    """
+    p = load_palette()
+    out, seen = [], set()
+    for name in PREFERRED + tuple("bright_" + n for n in PREFERRED[1:]):
+        rgb = p.get(name)
+        if rgb and rgb not in seen and sum(rgb) > 90:
+            out.append(rgb)
+            seen.add(rgb)
+    return out or [(122, 162, 247)]
+
+
+def theme_color():
+    """The single colour that represents the current theme.
+
+    keyboard.rgb looks like it should be the answer but is not: omarchy-kbd-rgb
+    ignores it, and tokyo-night ships a bare, unprefixed "ff00ff" placeholder
+    there while its real accent is #7aa2f7. Kept only as a last resort.
+    """
+    cols = theme_colors()
+    if cols:
+        return cols[0]
+    try:
+        val = open(os.path.join(THEME_DIR, "keyboard.rgb")).read().strip().lstrip("#")
+        if len(val) == 6:
+            return hex_rgb(val)
+    except (OSError, ValueError):
+        pass
+    return (122, 162, 247)
+
+
+def _lab(rgb):
+    """sRGB to CIE Lab, so colours can be compared the way an eye compares them."""
+    r, g, b = [c / 255.0 for c in rgb]
+    r, g, b = [((v + 0.055) / 1.055) ** 2.4 if v > 0.04045 else v / 12.92
+               for v in (r, g, b)]
+    x = (r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047
+    y = r * 0.2126 + g * 0.7152 + b * 0.0722
+    z = (r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883
+    f = lambda t: t ** (1.0 / 3) if t > 0.008856 else 7.787 * t + 16.0 / 116
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def _delta_e(a, b):
+    la, lb = _lab(a), _lab(b)
+    return sum((x - y) ** 2 for x, y in zip(la, lb)) ** 0.5
+
+
+def distinct_colors():
+    """The theme palette reordered so neighbours look as different as possible.
+
+    Palette order is useless for telling workspaces apart. Measured on the
+    hackerman theme: consecutive entries scored deltaE 3.8 and 3.4, where
+    anything under about 10 is indistinguishable, so switching workspace looked
+    like nothing happened at all.
+
+    Farthest-point ordering fixes that without inventing colours: start at the
+    accent, then repeatedly take whichever remaining palette entry is furthest
+    from everything already chosen. Low workspace numbers, the ones actually
+    used, get the biggest separation.
+    """
+    cols = theme_colors()
+    if len(cols) < 3:
+        return cols
+    out = [cols[0]]
+    rest = list(cols[1:])
+    while rest:
+        best = max(rest, key=lambda c: min(_delta_e(c, o) for o in out))
+        out.append(best)
+        rest.remove(best)
+    return out
+
+
+def mix_colors(n, mix=0):
+    """n theme colours chosen so all n look different FROM EACH OTHER.
+
+    An even stride through the palette is not enough: it happily paired
+    #cddbf4 with #d1fffe on hackerman (deltaE 3.4, two near-identical pale
+    whites) because those sit apart in the ordering but not in the eye.
+
+    So each mix is built greedily for maximum minimum pairwise separation,
+    seeded from a different palette entry. Mix k starts at palette[k], then
+    repeatedly adds whichever remaining colour is furthest from everything
+    already chosen. Different seed, genuinely different mix, and every mix is
+    internally as spread as that theme allows.
+
+    Every colour is a real theme colour; nothing is invented.
+    """
+    cols = theme_colors()
+    if not cols or n <= 0:
+        return []
+    seed = cols[mix % len(cols)]
+    out = [seed]
+    rest = [c for c in cols if c != seed]
+    while len(out) < n and rest:
+        best = max(rest, key=lambda c: min(_delta_e(c, o) for o in out))
+        out.append(best)
+        rest.remove(best)
+    # A palette smaller than the fleet: repeat rather than go dark.
+    while len(out) < n:
+        out.append(out[len(out) % len(out)])
+    return out[:n]
+
+
+def mix_count():
+    """How many distinct mixes exist before they repeat."""
+    return max(1, len(distinct_colors()))
+
+
+def theme_name():
+    try:
+        return open(os.path.expanduser(
+            "~/.local/state/omarchy/current/theme.name")).read().strip()
+    except OSError:
+        return "unknown"
+
+
+def theme_stamp():
+    """Cheap change-detector so a long-running effect can follow theme switches."""
+    try:
+        return os.stat(os.path.join(THEME_DIR, "colors.toml")).st_mtime
+    except OSError:
+        return 0
+
+
+# ---------------------------------------------------------------- transport
+
+
+class _RecvLock:
+    """Serialise everything that binds UDP 4002.
+
+    Several sockets can bind the reply port at once with SO_REUSEADDR, but
+    Linux delivers each unicast datagram to only ONE of them. So a bar poll
+    that starts mid-`discover` eats the lamp's replies and the other caller
+    starves to its timeout and reports the lamp offline. Measured: 5 of 5
+    concurrent json+discover rounds starved one side before this lock.
+
+    The windows are short (2-6s), so a plain blocking flock is enough.
+    """
+
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.fd = os.open(os.path.join(STATE_DIR, "recv.lock"),
+                          os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+        return False
+
+
+class Device:
+    """One physical Govee unit on the LAN."""
+
+    def __init__(self, cfg, ip=None, name=None, sku=None):
+        self.cfg = cfg
+        self.name = name or cfg.get("name", "lamp")
+        self.sku = sku or cfg.get("sku", "")
+        self.ip = ip or cfg.get("ip")
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._last_send = 0.0
+        self._last_rgb = None
+        self._last_bright = None
+
+    def _send(self, payload):
+        if not self.ip:
+            return
+        # Never exceed the rate the lamp was measured to handle.
+        gap = (1.0 / MAX_HZ) - (time.time() - self._last_send)
+        if gap > 0:
+            time.sleep(gap)
+        self.sock.sendto(json.dumps(payload).encode(), (self.ip, SEND_PORT))
+        self._last_send = time.time()
+
+    def color(self, rgb, force=False):
+        rgb = tuple(int(max(0, min(255, c))) for c in rgb)
+        if rgb == self._last_rgb and not force:
+            return
+        self._last_rgb = rgb
+        self._send({"msg": {"cmd": "colorwc", "data": {
+            "color": {"r": rgb[0], "g": rgb[1], "b": rgb[2]},
+            "colorTemInKelvin": 0}}})
+
+    def brightness(self, value, force=False):
+        value = int(max(1, min(100, value)))
+        if value == self._last_bright and not force:
+            return
+        self._last_bright = value
+        self._send({"msg": {"cmd": "brightness", "data": {"value": value}}})
+
+    def power(self, on):
+        self._send({"msg": {"cmd": "turn", "data": {"value": 1 if on else 0}}})
+
+    def ptreal(self, *packets):
+        """Tunnel raw 20-byte Govee BLE packets over the LAN API.
+
+        Verified working on this lamp (brightness set via 0x33 0x04 round-trips
+        in devStatus), so the whole BLE command space is reachable this way.
+        """
+        cmds = []
+        for pkt in packets:
+            data = list(pkt) + [0] * (19 - len(pkt))
+            ck = 0
+            for byte in data:
+                ck ^= byte
+            cmds.append(base64.b64encode(bytes(data + [ck])).decode())
+        self._send({"msg": {"cmd": "ptReal", "data": {"command": cmds}}})
+
+    def status(self, timeout=3):
+        if not self.ip:
+            return None
+        with _RecvLock():
+            return self._status_locked(timeout)
+
+    def _status_locked(self, timeout):
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            rx.bind(("0.0.0.0", RECV_PORT))
+        except OSError:
+            rx.close()
+            return None
+        rx.settimeout(0.3)
+        try:
+            end = time.time() + timeout
+            asked = 0.0
+            while time.time() < end:
+                # Re-ask periodically: while an effect is saturating the link at
+                # 20 Hz the lamp will drop the odd devStatus, and a single
+                # unanswered request would otherwise look like "lamp offline".
+                if time.time() - asked > 0.8:
+                    self._send({"msg": {"cmd": "devStatus", "data": {}}})
+                    asked = time.time()
+                try:
+                    data, _ = rx.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                try:
+                    return json.loads(data.decode())["msg"]["data"]
+                except (ValueError, KeyError):
+                    continue
+        finally:
+            rx.close()
+        return None
+
+    def fade(self, target, ms=800, start=None):
+        """Walk to a colour instead of snapping to it."""
+        start = start or self._last_rgb
+        if start is None:
+            live = self.status(timeout=2)
+            if live and "color" in live:
+                c = live["color"]
+                start = (c.get("r", 0), c.get("g", 0), c.get("b", 0))
+        if start is None or ms <= 0:
+            self.color(target, force=True)
+            return
+        # Paced by the clock, not by the send rate limiter. Over a long fade most
+        # steps round to the same 8-bit colour and are skipped, and the limiter
+        # only sleeps when it actually sends -- so pacing on it would spin the
+        # CPU for the whole fade.
+        steps = max(1, int((ms / 1000.0) * MAX_HZ))
+        begin = time.time()
+        for i in range(1, steps + 1):
+            self.color(lerp(start, target, i / steps))
+            due = begin + (i / MAX_HZ)
+            slack = due - time.time()
+            if slack > 0:
+                time.sleep(slack)
+        self.color(target)
+
+
+def device_list(cfg):
+    """Every enabled device, migrating the old single-ip config on the fly."""
+    devs = cfg.get("devices")
+    if not isinstance(devs, list) or not devs:
+        # Legacy config: one lamp described by top-level ip/name/sku.
+        if cfg.get("ip"):
+            devs = [{"name": cfg.get("name", "lamp"), "ip": cfg["ip"],
+                     "sku": cfg.get("sku", ""), "device_id": cfg.get("device_id"),
+                     "enabled": True}]
+        else:
+            devs = []
+    return [d for d in devs if d.get("enabled", True) and d.get("ip")]
+
+
+class Lamp:
+    """The fleet, addressed as if it were one lamp.
+
+    Every effect was written against a single device. Rather than teach each
+    one to loop, the group keeps the same method names and fans each call out,
+    so ambient / workspace / gauge / music are unchanged and a second lamp or a
+    pair of light bars is pure configuration.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.devices = [Device(cfg, ip=d["ip"], name=d.get("name"), sku=d.get("sku"))
+                        for d in device_list(cfg)]
+        # Fall back to the legacy single device so a half-written config still lights up.
+        if not self.devices and cfg.get("ip"):
+            self.devices = [Device(cfg)]
+
+    @property
+    def ip(self):
+        return self.devices[0].ip if self.devices else None
+
+    def _fan(self, method, *args, **kw):
+        for d in self.devices:
+            try:
+                getattr(d, method)(*args, **kw)
+            except OSError:
+                # One unreachable unit must never stop the others.
+                pass
+
+    def color(self, rgb, force=False):
+        self._fan("color", rgb, force=force)
+
+    def brightness(self, value, force=False):
+        self._fan("brightness", value, force=force)
+
+    def power(self, on):
+        self._fan("power", on)
+
+    def ptreal(self, *packets):
+        self._fan("ptreal", *packets)
+
+    def status(self, timeout=3):
+        """Read back from the first device that answers."""
+        for d in self.devices:
+            st = d.status(timeout=timeout)
+            if st:
+                return st
+        return None
+
+    def statuses(self, timeout=2):
+        return [(d.name, d.ip, d.status(timeout=timeout)) for d in self.devices]
+
+    def colors(self, rgbs, force=False):
+        """Give each device its own colour, in device order."""
+        for d, rgb in zip(self.devices, rgbs):
+            try:
+                d.color(rgb, force=force)
+            except OSError:
+                pass
+
+    def fade_multi(self, targets, ms=800, starts=None):
+        """Fade every device to its OWN target, all in lockstep.
+
+        Paced once for the whole group, exactly like fade(): stepping each
+        device through its own fade in turn would stagger them by the full
+        duration and the mix would never be on screen at the same time.
+        """
+        if not self.devices:
+            return
+        n = len(self.devices)
+        targets = list(targets)[:n]
+        if starts is None:
+            starts = [d._last_rgb for d in self.devices]
+        starts = [s if s is not None else (0, 0, 0) for s in starts[:n]]
+        if ms <= 0:
+            self.colors(targets, force=True)
+            return
+        steps = max(1, int((ms / 1000.0) * MAX_HZ))
+        begin = time.time()
+        for i in range(1, steps + 1):
+            t = i / steps
+            self.colors([lerp(s, g, t) for s, g in zip(starts, targets)])
+            due = begin + (i / MAX_HZ)
+            slack = due - time.time()
+            if slack > 0:
+                time.sleep(slack)
+        self.colors(targets)
+
+    def fade(self, target, ms=800, start=None):
+        """Fade the whole fleet together.
+
+        Driven from the group so all units step in lockstep; fading each device
+        in turn would stagger them by the full duration.
+        """
+        if not self.devices:
+            return
+        if start is None:
+            start = self.devices[0]._last_rgb
+            if start is None:
+                live = self.status(timeout=2)
+                if live and "color" in live:
+                    c = live["color"]
+                    start = (c.get("r", 0), c.get("g", 0), c.get("b", 0))
+        if start is None or ms <= 0:
+            self.color(target, force=True)
+            return
+        steps = max(1, int((ms / 1000.0) * MAX_HZ))
+        begin = time.time()
+        for i in range(1, steps + 1):
+            self.color(lerp(start, target, i / steps))
+            due = begin + (i / MAX_HZ)
+            slack = due - time.time()
+            if slack > 0:
+                time.sleep(slack)
+        self.color(target)
+
+
+def discover(cfg, timeout=5):
+    with _RecvLock():
+        return _discover_locked(cfg, timeout)
+
+
+def _discover_locked(cfg, timeout):
+    found = {}
+    msg = json.dumps({"msg": {"cmd": "scan", "data": {"account_topic": "reserve"}}}).encode()
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    rx.bind(("0.0.0.0", RECV_PORT))
+    rx.settimeout(0.3)
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tx.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    try:
+        tx.sendto(msg, (MULTICAST, SCAN_PORT))
+        # Some APs drop multicast between wired and wireless clients; the lamp
+        # answers a unicast scan just as happily.
+        if cfg.get("ip"):
+            tx.sendto(msg, (cfg["ip"], SCAN_PORT))
+            tx.sendto(msg, (cfg["ip"], SEND_PORT))
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, addr = rx.recvfrom(4096)
+            except socket.timeout:
+                continue
+            try:
+                body = json.loads(data.decode())["msg"]["data"]
+            except (ValueError, KeyError):
+                continue
+            body.setdefault("ip", addr[0])
+            found[addr[0]] = body
+    finally:
+        rx.close()
+        tx.close()
+    return found
+
+
+def cloud_control(cfg, capability):
+    key = os.environ.get("GOVEE_API_KEY") or cfg.get("api_key")
+    device = cfg.get("device_id")
+    if not (key and device):
+        return False, "no cloud credentials (GOVEE_API_KEY + device_id)"
+    body = json.dumps({"requestId": str(uuid.uuid4()), "payload": {
+        "sku": cfg.get("sku", "H6020"), "device": device,
+        "capability": capability}}).encode()
+    req = urllib.request.Request(CLOUD_URL, data=body, headers={
+        "Content-Type": "application/json", "Govee-API-Key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return True, resp.read().decode()[:200]
+    except Exception as exc:  # noqa: BLE001 - surface whatever the API said
+        return False, str(exc)
+
+
+# ---------------------------------------------------------------- daemon
+
+
+def daemon_pid():
+    """PID of a running effect daemon, or None.
+
+    Only one process may drive the lamp: two effects fighting over 20 Hz of UDP
+    looks like a fault, not a feature. Same contention rule omarchy-kbd-rgb has
+    with LightShow over the keyboard.
+    """
+    try:
+        pid = int(open(PIDFILE).read().strip())
+    except (OSError, ValueError):
+        return None
+    if pid <= 0 or pid == os.getpid():
+        return None
+    # A stale pidfile whose number has since been recycled would otherwise make
+    # stop_daemon() SIGTERM whatever unrelated process now owns it. Confirm the
+    # process is actually one of ours before ever signalling it.
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmdline = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return None
+    if "govee-lamp" not in cmdline:
+        return None
+    return pid
+
+
+_LOCK_FD = None
+
+
+def claim():
+    """Become the single process driving the lamp.
+
+    The pidfile alone was check-then-act: two effects starting at once both saw
+    no live daemon, both proceeded, and only the last one's pid was recorded --
+    so they fought over the lamp at 40 Hz and `stop` could only ever kill one of
+    them. An flock held for the whole process lifetime cannot be double-taken
+    and cannot be faked by a stale file.
+    """
+    global _LOCK_FD
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _LOCK_FD = os.open(os.path.join(STATE_DIR, "daemon.lock"),
+                       os.O_CREAT | os.O_RDWR, 0o644)
+    for attempt in range(2):
+        try:
+            fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if attempt:
+                print("another effect already holds the lamp", file=sys.stderr)
+                sys.exit(1)
+            stop_daemon(quiet=True)
+            # Give the outgoing daemon a moment to drop the lock.
+            for _ in range(40):
+                try:
+                    fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                continue
+            break
+
+    with open(PIDFILE, "w") as fh:
+        fh.write(str(os.getpid()))
+
+    def release(*_):
+        # Only remove the pidfile if it is still OURS. A slow exit could
+        # otherwise delete the pidfile of the daemon that replaced us, leaving
+        # a running effect that nothing can find or stop.
+        try:
+            if int(open(PIDFILE).read().strip()) == os.getpid():
+                os.unlink(PIDFILE)
+        except (OSError, ValueError):
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, release)
+    signal.signal(signal.SIGINT, release)
+
+
+def stop_daemon(quiet=False):
+    pid = daemon_pid()
+    if not pid:
+        if not quiet:
+            print("no effect running")
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return False
+    for _ in range(30):
+        if not daemon_pid():
+            break
+        time.sleep(0.1)
+    if not quiet:
+        print("stopped effect (pid %d)" % pid)
+    return True
+
+
+# ---------------------------------------------------------------- sources
+
+
+def _cpu_sample(prev):
+    with open("/proc/stat") as fh:
+        parts = [float(x) for x in fh.readline().split()[1:]]
+    idle, total = parts[3] + parts[4], sum(parts)
+    if prev is None:
+        return 0.0, (idle, total)
+    d_idle, d_total = idle - prev[0], total - prev[1]
+    busy = 0.0 if d_total <= 0 else 1.0 - (d_idle / d_total)
+    return max(0.0, min(1.0, busy)), (idle, total)
+
+
+def claude_burn(which="max"):
+    """Current Claude usage as 0..1, from Omarchy's own agent-usage cache.
+
+    The cache stores fractions, not percents (0.95 means 95%).
+    """
+    try:
+        data = json.load(open(os.path.expanduser(
+            "~/.cache/omarchy/agent-usage/claude-limits.json")))
+    except (OSError, ValueError):
+        return None
+    vals = {}
+    for lim in data.get("limits", []):
+        label = (lim.get("label") or "").lower()
+        try:
+            vals[label] = float(lim.get("percent"))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return None
+    if which == "session":
+        return next((v for k, v in vals.items() if "session" in k), max(vals.values()))
+    if which == "weekly":
+        return next((v for k, v in vals.items() if "week" in k), max(vals.values()))
+    return max(vals.values())
+
+
+def read_source(name, state, exec_cmd=None):
+    """Return (value 0..1, new_state) for a status source."""
+    if exec_cmd:
+        try:
+            out = subprocess.run(exec_cmd, shell=True, capture_output=True,
+                                 text=True, timeout=8).stdout.strip()
+            val = float(re.findall(r"-?\d+\.?\d*", out)[0])
+            return max(0.0, min(1.0, val / 100.0 if val > 1.0 else val)), state
+        except Exception:  # noqa: BLE001 - a bad source must not kill the effect
+            return 0.0, state
+    if name == "cpu":
+        return _cpu_sample(state)
+    if name == "mem":
+        info = {}
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            info[k] = float(v.split()[0])
+        used = 1.0 - (info.get("MemAvailable", 0) / max(1.0, info.get("MemTotal", 1)))
+        return max(0.0, min(1.0, used)), state
+    if name == "battery":
+        for bat in ("BAT0", "BAT1"):
+            path = "/sys/class/power_supply/%s/capacity" % bat
+            if os.path.exists(path):
+                return 1.0 - (float(open(path).read().strip()) / 100.0), state
+        return 0.0, state
+    if name == "gpu":
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=8).stdout.strip()
+            return max(0.0, min(1.0, float(out.splitlines()[0]) / 100.0)), state
+        except Exception:  # noqa: BLE001
+            return 0.0, state
+    if name.startswith("claude"):
+        _, _, which = name.partition("-")
+        val = claude_burn(which or "max")
+        return (0.0 if val is None else max(0.0, min(1.0, val))), state
+    return 0.0, state
+
+
+SOURCES = ("claude", "claude-session", "claude-weekly", "cpu", "gpu", "mem", "battery")
+
+
+# ---------------------------------------------------------------- effects
+
+
+def cmd_ambient(cfg, args):
+    """Fade continuously around the theme's whole palette.
+
+    Timed as ONE full lap of the palette rather than per-colour, because that
+    is the thing you actually perceive; a theme with 13 colours and one with 7
+    then drift at the same visible speed instead of the richer theme crawling.
+    Each leg is cycle/len(palette), and there is no dwell -- the lamp is always
+    moving between two colours.
+    """
+    cycle = _num(_opt(args, "--cycle", cfg.get("ambient_cycle", AMBIENT_CYCLE_DEFAULT)),
+                 AMBIENT_CYCLE_DEFAULT)
+    cycle = max(AMBIENT_CYCLE_MIN, min(AMBIENT_CYCLE_MAX, cycle))
+    hold = max(0.0, _num(_opt(args, "--hold", 0), 0))
+    claim()
+    lamp = Lamp(cfg)
+    cols = theme_colors()
+    stamp = theme_stamp()
+    idx = 0
+    lamp.fade(cols[0], 1200)
+    while True:
+        if theme_stamp() != stamp:
+            stamp = theme_stamp()
+            cols = theme_colors()
+            idx = 0
+            lamp.fade(cols[0], 1200)
+            continue
+        # Re-read each lap so a slider change is picked up without a restart.
+        live = cfg_value(cfg, "ambient_cycle", cycle)
+        leg = max(AMBIENT_CYCLE_MIN, min(AMBIENT_CYCLE_MAX, live)) / max(1, len(cols))
+        idx = (idx + 1) % len(cols)
+        lamp.fade(cols[idx], leg * 1000.0)
+        if hold > 0:
+            time.sleep(hold)
+
+
+def cmd_status_fx(cfg, args):
+    """Turn the lamp into a gauge: theme accent when idle, red when maxed."""
+    source = _opt(args, "--source", cfg.get("gauge_source", "claude"))
+    exec_cmd = _opt(args, "--exec", None)
+    # A zero here span-locked the loop into back-to-back --exec subprocesses.
+    every = max(1.0, _num(_opt(args, "--every", 10), 10))
+    pulse = "--pulse" in args
+    claim()
+    lamp = Lamp(cfg)
+    state = None
+    stamp = theme_stamp()
+    cool = theme_color()
+    pal = load_palette()
+    warn = pal.get("yellow", (233, 187, 79))
+    hot = pal.get("red", (237, 91, 90))
+    last = None
+    while True:
+        if theme_stamp() != stamp:
+            stamp = theme_stamp()
+            pal = load_palette()
+            cool = theme_color()
+            warn = pal.get("yellow", warn)
+            hot = pal.get("red", hot)
+        val, state = read_source(source, state, exec_cmd)
+        target = lerp(cool, warn, val / 0.7) if val < 0.7 else lerp(warn, hot, (val - 0.7) / 0.3)
+        lamp.fade(target, 1200, start=last)
+        last = target
+        # Opt-in only. A lamp that pulses in your peripheral vision all day is
+        # an irritant, not information -- the colour alone already says it.
+        end = time.time() + every
+        while time.time() < end:
+            if pulse and val >= 0.9:
+                for i in range(20):
+                    lamp.color(scale(target, 0.35 + 0.65 * (0.5 + 0.5 * math.sin(i / 20.0 * 2 * math.pi))))
+                last = None
+            else:
+                time.sleep(0.25)
+
+
+def cmd_music(cfg, args):
+    """Drive the lamp off whatever is playing through the JBL speaker.
+
+    Reads the lamp's own PipeWire monitor, so it reacts to exactly what the
+    speaker is playing rather than to the room.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        print("music mode needs numpy", file=sys.stderr)
+        return 1
+
+    rainbow = "--rainbow" in args
+    gain = max(0.01, _num(_opt(args, "--gain", 1.0), 1.0))
+    bt = cfg.get("bt_mac", "").replace(":", "_")
+    source = _opt(args, "--source", "bluez_output.%s.1.monitor" % bt if bt else None)
+    if not source:
+        print("no audio source; pair the speaker first or pass --source", file=sys.stderr)
+        return 1
+
+    rate, chunk = 44100, 2048
+    claim()
+    try:
+        proc = subprocess.Popen(
+            ["parec", "-d", source, "--format=s16le", "--rate=%d" % rate,
+             "--channels=1", "--latency-msec=30"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        # Without this, a missing parec crash-looped the unit every 15s with a
+        # traceback instead of one readable line.
+        print("cannot start parec: %s" % exc, file=sys.stderr)
+        return 1
+    lamp = Lamp(cfg)
+    cols = theme_colors()
+    stamp = theme_stamp()
+    window = np.hanning(chunk)
+    freqs = np.fft.rfftfreq(chunk, 1.0 / rate)
+    bass = freqs < 250
+    mid = (freqs >= 250) & (freqs < 2000)
+    high = freqs >= 2000
+    floor = 1e-6
+    peak = 1.0
+    try:
+        while True:
+            raw = proc.stdout.read(chunk * 2)
+            if not raw or len(raw) < chunk * 2:
+                # The monitor source vanished -- the speaker dropped, or
+                # PipeWire rebuilt the node. Exiting 0 here made systemd treat
+                # it as a clean stop and never restart, so music silently
+                # stayed dead until the mode was reselected.
+                print("audio source ended: %s" % source, file=sys.stderr)
+                return 1
+            if theme_stamp() != stamp:
+                stamp = theme_stamp()
+                cols = theme_colors()
+
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            spec = np.abs(np.fft.rfft(samples * window))
+            b = float(spec[bass].mean()) + floor
+            m = float(spec[mid].mean()) + floor
+            h = float(spec[high].mean()) + floor
+            energy = b + m + h
+
+            # Rolling peak so quiet tracks still fill the range.
+            peak = max(energy, peak * 0.995)
+            level = min(1.0, (energy / peak) * gain)
+
+            if rainbow:
+                hue = (m + 2 * h) / (b + m + h)
+                rgb = hsv_rgb(min(0.95, hue), 1.0, 1.0)
+            else:
+                # Stay inside the theme: bass picks the first colour, treble
+                # the last, so the lamp still reads as part of the desk.
+                pos = min(0.999, (m + 2 * h) / (b + m + h))
+                span = pos * (len(cols) - 1)
+                i = int(span)
+                rgb = lerp(cols[i], cols[min(i + 1, len(cols) - 1)], span - i)
+
+            lamp.color(scale(rgb, 0.25 + 0.75 * level))
+    finally:
+        proc.terminate()
+    return 0
+
+
+# ---------------------------------------------------------------- warmth
+
+
+def warm_cool_axis():
+    """Split the theme palette into a cool end and a warm end.
+
+    Every effect here has to express itself in the CURRENT theme's colours --
+    the lamp carries the system theme, it never picks its own. So "warmer" means
+    "further along this theme's own warm colours", not a hardcoded amber.
+    """
+    p = load_palette()
+    cool = [p[k] for k in ("cyan", "blue", "accent") if k in p]
+    warm = [p[k] for k in ("orange", "yellow", "red", "brown") if k in p]
+    mid = [p[k] for k in ("green", "accent") if k in p]
+    return (cool or [theme_color()], mid or [theme_color()], warm or [theme_color()])
+
+
+def blend_axis(t):
+    """t in 0..1 walks cool -> mid -> warm through the theme's own colours."""
+    cool, mid, warm = warm_cool_axis()
+    if t < 0.5:
+        return lerp(cool[0], mid[0], t / 0.5)
+    return lerp(mid[0], warm[0], (t - 0.5) / 0.5)
+
+
+def sun_times(cfg):
+    """Today's sunrise/sunset as hours-since-midnight, via open-meteo.
+
+    Keyless and free -- the same service the Omarchy weather plugin uses.
+    Falls back to a plain 7am/7pm if the network is not there.
+    """
+    lat = cfg.get("latitude", 33.749)
+    lon = cfg.get("longitude", -84.388)
+    cache = os.path.join(STATE_DIR, "sun.json")
+    try:
+        st = os.stat(cache)
+        if time.time() - st.st_mtime < 6 * 3600:
+            data = json.load(open(cache))
+            return data["rise"], data["set"]
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+               "&daily=sunrise,sunset&timezone=auto&forecast_days=1" % (lat, lon))
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            d = json.load(resp)
+        rise = d["daily"]["sunrise"][0][11:16]
+        sset = d["daily"]["sunset"][0][11:16]
+        to_h = lambda s: int(s[:2]) + int(s[3:5]) / 60.0
+        out = {"rise": to_h(rise), "set": to_h(sset)}
+        os.makedirs(STATE_DIR, exist_ok=True)
+        json.dump(out, open(cache, "w"))
+        return out["rise"], out["set"]
+    except Exception:  # noqa: BLE001 - never let weather kill the lamp
+        return 7.0, 19.0
+
+
+def cmd_circadian(cfg, args):
+    """Track the sun using the theme's own cool-to-warm range.
+
+    Cool and bright around solar noon, warm and dim after sunset. Nothing here
+    moves fast enough to catch your eye -- that is the point of it.
+    """
+    claim()
+    lamp = Lamp(cfg)
+    lo = int(_num(_opt(args, "--min-brightness", 18), 18))
+    hi = int(_num(_opt(args, "--max-brightness", 100), 100))
+    last = None
+    while True:
+        rise, sset = sun_times(cfg)
+        now = time.localtime()
+        hour = now.tm_hour + now.tm_min / 60.0
+        noon = (rise + sset) / 2.0
+        half = max(0.5, (sset - rise) / 2.0)
+        # 0 at solar noon, 1 deep in the night.
+        away = min(1.0, abs(hour - noon) / half)
+        rgb = blend_axis(away)
+        bright = int(hi - (hi - lo) * (away ** 1.6))
+        if rgb != last:
+            lamp.fade(rgb, 4000, start=last)
+            last = rgb
+        lamp.brightness(bright)
+        end = time.time() + 300
+        while time.time() < end:
+            time.sleep(1.0)
+
+
+WEATHER_CACHE = "weather.json"
+
+
+def weather_now(cfg):
+    """Current conditions from open-meteo. Keyless, cached for 15 minutes."""
+    cache = os.path.join(STATE_DIR, WEATHER_CACHE)
+    try:
+        if time.time() - os.stat(cache).st_mtime < 900:
+            return json.load(open(cache))
+    except (OSError, ValueError):
+        pass
+    lat = cfg.get("latitude", 33.749)
+    lon = cfg.get("longitude", -84.388)
+    try:
+        url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+               "&current=temperature_2m,weather_code,cloud_cover"
+               "&temperature_unit=fahrenheit&timezone=auto" % (lat, lon))
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            cur = json.load(resp)["current"]
+        os.makedirs(STATE_DIR, exist_ok=True)
+        json.dump(cur, open(cache, "w"))
+        return cur
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cmd_weather(cfg, args):
+    """Outside temperature as a position on the theme's cool-to-warm axis."""
+    claim()
+    lamp = Lamp(cfg)
+    cold = _num(_opt(args, "--cold", 35), 35)
+    hot = _num(_opt(args, "--hot", 95), 95)
+    last = None
+    while True:
+        cur = weather_now(cfg)
+        if cur:
+            temp = float(cur.get("temperature_2m", 60))
+            t = max(0.0, min(1.0, (temp - cold) / max(1.0, hot - cold)))
+            rgb = blend_axis(t)
+            # Heavy cloud reads as a dimmer lamp, not a different colour.
+            cloud = float(cur.get("cloud_cover", 0)) / 100.0
+            lamp.brightness(int(100 - 45 * cloud))
+            if rgb != last:
+                lamp.fade(rgb, 4000, start=last)
+                last = rgb
+        end = time.time() + 900
+        while time.time() < end:
+            time.sleep(1.0)
+
+
+EVENT_FILE = "events"
+EVENT_TINTS = {"ok": "green", "fail": "red", "warn": "yellow", "info": "cyan"}
+
+
+def cmd_events(cfg, args):
+    """Sit on the theme colour and only move when something actually happens.
+
+    Anything can ring it:  govee-lamp flash ok|warn|fail|info
+    which is one line appended to ~/.local/state/govee-lamp/events.
+    """
+    claim()
+    lamp = Lamp(cfg)
+    hold = max(0.0, _num(_opt(args, "--hold", 4), 4))
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, EVENT_FILE)
+    open(path, "a").close()
+    pos = os.stat(path).st_size
+    base = theme_color()
+    stamp = theme_stamp()
+    lamp.fade(base, 1500)
+    while True:
+        if theme_stamp() != stamp:
+            stamp = theme_stamp()
+            base = theme_color()
+            lamp.fade(base, 1500)
+        try:
+            size = os.stat(path).st_size
+            if size < pos:
+                pos = 0
+            if size > pos:
+                with open(path) as fh:
+                    fh.seek(pos)
+                    lines = fh.read().splitlines()
+                    pos = fh.tell()
+                kind = (lines[-1].strip().lower() if lines else "info")
+                # Only the newest line is ever used, so truncate once it has
+                # been consumed rather than growing a log nobody reads.
+                if pos > 64000:
+                    open(path, "w").close()
+                    pos = 0
+                pal = load_palette()
+                tint = pal.get(EVENT_TINTS.get(kind, "cyan"), base)
+                lamp.fade(tint, 350)
+                time.sleep(hold)
+                lamp.fade(base, 1200)
+        except OSError:
+            pass
+        time.sleep(0.4)
+
+
+def cmd_flash(cfg, args):
+    """Ring the events effect from anywhere (a hook, CI, a git alias)."""
+    kind = (args[0] if args else "info").lower()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, EVENT_FILE), "a") as fh:
+        fh.write(kind + "\n")
+    if not daemon_pid():
+        print("noted, but no effect is running to show it")
+        return 1
+    print("flashed %s" % kind)
+    return 0
+
+
+# ---------------------------------------------------------------- modes
+
+
+MODES = ("theme", "mix", "ambient", "workspace", "circadian", "weather",
+         "events", "music", "gauge", "off")
+UNIT = "govee-lamp.service"
+
+
+def cmd_mode(cfg, args):
+    """Set the persistent mode and hand it to systemd.
+
+    The plugin drives exactly this, so the bar, the CLI and a reboot all agree
+    on one source of truth instead of three.
+    """
+    if not args:
+        print(cfg.get("mode", "theme"))
+        return 0
+    mode = args[0].lower()
+    if mode not in MODES:
+        print("mode must be one of: %s" % ", ".join(MODES), file=sys.stderr)
+        return 2
+    cfg["mode"] = mode
+    save_config(cfg)
+    subprocess.run(["systemctl", "--user", "restart", UNIT],
+                   capture_output=True, timeout=30)
+    print("mode %s" % mode)
+    return 0
+
+
+def cmd_run(cfg, args):
+    """What the systemd unit runs: dispatch on the persisted mode."""
+    mode = cfg.get("mode", "theme")
+    if mode == "off":
+        Lamp(cfg).power(False)
+        return 0
+    if mode == "theme":
+        # Static colour, but resident, so a theme switch is picked up even if
+        # the theme-set hook never fires.
+        claim()
+        lamp = Lamp(cfg)
+        stamp = None
+        while True:
+            if stamp != theme_stamp():
+                stamp = theme_stamp()
+                lamp.fade(theme_color(), 1200)
+            time.sleep(2)
+    handler = {
+        "mix": cmd_mix_mode,
+        "ambient": cmd_ambient, "workspace": cmd_workspace,
+        "circadian": cmd_circadian,
+        "weather": cmd_weather, "events": cmd_events,
+        "music": cmd_music, "gauge": cmd_status_fx,
+    }.get(mode)
+    if handler is None:
+        # The config is hand-editable and survives downgrades. A bare lookup
+        # here turned a typo into a systemd restart-flap every 15s with the
+        # lamp dead; fall back to the one mode that always works.
+        print("unknown mode %r; falling back to theme" % mode, file=sys.stderr)
+        return cmd_run(dict(cfg, mode="theme"), args)
+    return handler(cfg, args)
+
+
+
+def hypr_socket():
+    """Newest Hyprland event socket for this session.
+
+    Globbed rather than built from HYPRLAND_INSTANCE_SIGNATURE, because a
+    systemd --user unit does not inherit that variable, and stale instance
+    directories from earlier sessions linger in the runtime dir.
+    """
+    import glob
+    base = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    socks = glob.glob(os.path.join(base, "hypr", "*", ".socket2.sock"))
+    if not socks:
+        return None
+    return max(socks, key=lambda p: os.stat(os.path.dirname(p)).st_mtime)
+
+
+def active_workspace():
+    try:
+        out = subprocess.run(["hyprctl", "activeworkspace", "-j"],
+                             capture_output=True, text=True, timeout=5).stdout
+        return int(json.loads(out)["id"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cmd_workspace(cfg, args):
+    """Give every workspace its own colour from the theme.
+
+    Driven off Hyprland's event socket rather than polling, so the lamp turns
+    over as the workspace does instead of up to a second later.
+
+    The colour is the palette entry at (workspace - 1) modulo the palette
+    length, so the mapping is stable for a given theme and wraps for people
+    with more workspaces than the theme has colours.
+    """
+    ms = int(_num(_opt(args, "--ms", 350), 350))
+    claim()
+    lamp = Lamp(cfg)
+    cols = distinct_colors()
+    stamp = theme_stamp()
+    last_ws = None
+
+    def paint(ws, force=False):
+        if ws is None:
+            return
+        rgb = cols[(ws - 1) % len(cols)]
+        lamp.fade(rgb, ms)
+
+    sock_path = hypr_socket()
+    if not sock_path:
+        print("no Hyprland event socket found", file=sys.stderr)
+        return 1
+
+    while True:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(sock_path)
+            sock.settimeout(1.0)
+        except OSError:
+            time.sleep(3)
+            sock_path = hypr_socket() or sock_path
+            continue
+
+        last_ws = active_workspace()
+        paint(last_ws, force=True)
+
+        buf = ""
+        try:
+            while True:
+                # A theme switch has to recolour the CURRENT workspace too, and
+                # the socket may be silent for hours, so the read is given a
+                # timeout rather than blocking forever.
+                if theme_stamp() != stamp:
+                    stamp = theme_stamp()
+                    cols = distinct_colors()
+                    paint(last_ws, force=True)
+                try:
+                    chunk = sock.recv(8192).decode("utf-8", "replace")
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+                while "\n" in buf:
+                    line, _, buf = buf.partition("\n")
+                    name, _, payload = line.partition(">>")
+                    ws = None
+                    if name == "workspacev2":
+                        # "ID,NAME" -- prefer the id, names can be anything
+                        # once the workspace-names plugin is in play.
+                        try:
+                            ws = int(payload.split(",", 1)[0])
+                        except ValueError:
+                            ws = None
+                    elif name == "workspace":
+                        try:
+                            ws = int(payload)
+                        except ValueError:
+                            ws = active_workspace()
+                    elif name == "focusedmon":
+                        # Focus moved to another monitor; its active workspace
+                        # is not in the payload in a form we can trust.
+                        ws = active_workspace()
+                    if ws is not None and ws != last_ws:
+                        last_ws = ws
+                        paint(ws)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+        time.sleep(1)
+
+
+def cmd_mix_mode(cfg, args):
+    """Every device wears a different theme colour, together.
+
+    Holds still until something changes: the theme, the mix index (the left
+    pedal bumps it), or the fleet. Re-read from disk each tick so an external
+    nudge lands without restarting the effect.
+    """
+    ms = int(_num(_opt(args, "--ms", 1400), 1400))
+    claim()
+    lamp = Lamp(cfg)
+    if not lamp.devices:
+        print("no devices configured; run: govee-lamp devices scan", file=sys.stderr)
+        return 1
+    stamp = None
+    shown = None
+    while True:
+        idx = int(cfg_value(cfg, "mix_index", 0))
+        now = (theme_stamp(), idx, len(lamp.devices))
+        if now != stamp:
+            stamp = now
+            targets = mix_colors(len(lamp.devices), idx)
+            lamp.fade_multi(targets, ms, starts=shown)
+            shown = targets
+        time.sleep(0.5)
+
+
+def cmd_mix(cfg, args):
+    """Show, set, or advance which mix the fleet is wearing."""
+    total = mix_count()
+    cur = int(_num(cfg.get("mix_index", 0), 0))
+    if args and args[0] == "next":
+        cur = (cur + 1) % total
+    elif args and args[0] == "prev":
+        cur = (cur - 1) % total
+    elif args:
+        cur = int(_num(args[0], cur)) % total
+    else:
+        n = len(Lamp(cfg).devices) or 4
+        print("mix %d of %d: %s" % (cur, total,
+              " ".join(rgb_hex(c) for c in mix_colors(n, cur))))
+        return 0
+    cfg["mix_index"] = cur
+    save_config(cfg)
+    n = len(Lamp(cfg).devices) or 4
+    print("mix %d of %d: %s" % (cur, total,
+          " ".join(rgb_hex(c) for c in mix_colors(n, cur))))
+    return 0
+
+
+def cmd_ambient_cycle(cfg, args):
+    """Seconds for one full lap of the palette. Applied live, no restart."""
+    if not args:
+        print(cfg.get("ambient_cycle", AMBIENT_CYCLE_DEFAULT))
+        return 0
+    try:
+        val = float(args[0])
+    except (TypeError, ValueError):
+        print("cycle must be a number of seconds", file=sys.stderr)
+        return 2
+    cfg["ambient_cycle"] = max(AMBIENT_CYCLE_MIN, min(AMBIENT_CYCLE_MAX, val))
+    save_config(cfg)
+    print("ambient cycle %gs" % cfg["ambient_cycle"])
+    return 0
+
+
+def cmd_devices(cfg, args):
+    """List the fleet, or add every Govee unit answering on the LAN.
+
+    `devices scan` is the unboxing command: flip LAN Control on in the app,
+    run it, and each new unit joins the fleet with its sku and device id.
+    """
+    sub = args[0] if args else "list"
+
+    if sub == "scan":
+        hits = discover(cfg, timeout=6)
+        if not hits:
+            print("nothing answered. Turn LAN Control on for each device in the")
+            print("Govee Home app, then run this again.")
+            return 1
+        devs = cfg.get("devices")
+        if not isinstance(devs, list):
+            devs = [d for d in device_list(cfg)]
+        by_ip = {d.get("ip"): d for d in devs}
+        added = 0
+        for ip, info in sorted(hits.items()):
+            entry = by_ip.get(ip)
+            if entry is None:
+                entry = {"name": info.get("sku", "govee") + " " + ip.split(".")[-1],
+                         "ip": ip, "enabled": True}
+                devs.append(entry)
+                added += 1
+                print("  added   %-15s %s" % (ip, info.get("sku", "?")))
+            else:
+                print("  known   %-15s %s" % (ip, info.get("sku", "?")))
+            entry["sku"] = info.get("sku", entry.get("sku", ""))
+            entry["device_id"] = info.get("device", entry.get("device_id"))
+        cfg["devices"] = devs
+        save_config(cfg)
+        print("%d added, %d total. Rename them in %s" % (added, len(devs), CONFIG))
+        return 0
+
+    if sub in ("enable", "disable") and len(args) > 1:
+        want = args[1].lower()
+        devs = cfg.get("devices") or device_list(cfg)
+        hit = False
+        for d in devs:
+            if want in (d.get("name", "").lower(), d.get("ip", "")):
+                d["enabled"] = (sub == "enable")
+                hit = True
+        if not hit:
+            print("no device matching %r" % args[1], file=sys.stderr)
+            return 2
+        cfg["devices"] = devs
+        save_config(cfg)
+        print("%sd %s" % (sub, args[1]))
+        return 0
+
+    devs = cfg.get("devices")
+    if not isinstance(devs, list) or not devs:
+        devs = device_list(cfg)
+    if not devs:
+        print("no devices. Run: govee-lamp devices scan")
+        return 1
+    lamp = Lamp(cfg)
+    live = {ip: st for _, ip, st in lamp.statuses(timeout=2)}
+    for d in devs:
+        st = live.get(d.get("ip"))
+        print("  %-20s %-15s %-7s %-9s %s" % (
+            d.get("name", "?"), d.get("ip", "?"), d.get("sku", "?"),
+            "enabled" if d.get("enabled", True) else "disabled",
+            ("%s on=%s bri=%s" % (rgb_hex((st.get("color", {}).get("r", 0),
+                                           st.get("color", {}).get("g", 0),
+                                           st.get("color", {}).get("b", 0))),
+                                  st.get("onOff"), st.get("brightness")))
+            if st else "SILENT"))
+    return 0
+
+
+def cmd_gauge_source(cfg, args):
+    """Pick what the gauge measures, and relight it if it is the live mode."""
+    if not args:
+        print(cfg.get("gauge_source", "claude"))
+        return 0
+    name = args[0].lower()
+    if name not in SOURCES:
+        print("source must be one of: %s" % ", ".join(SOURCES), file=sys.stderr)
+        return 2
+    cfg["gauge_source"] = name
+    save_config(cfg)
+    if cfg.get("mode") == "gauge":
+        subprocess.run(["systemctl", "--user", "restart", UNIT],
+                       capture_output=True, timeout=30)
+    print("gauge source %s" % name)
+    return 0
+
+
+def _device_json(name, ip, st):
+    """One device's state, flattened for the bar plugin."""
+    c = (st or {}).get("color") or {}
+    return {
+        "name": name,
+        "ip": ip,
+        "reachable": bool(st),
+        "on": bool((st or {}).get("onOff", 0)),
+        "brightness": (st or {}).get("brightness", 0),
+        "color": rgb_hex((c.get("r", 0), c.get("g", 0), c.get("b", 0))) if st else None,
+    }
+
+
+def cmd_json(cfg, args):
+    """Machine-readable state for the bar plugin. Never fails, never blocks long."""
+    fleet = Lamp(cfg)
+    # The bar polls this every few seconds. Probing every device serially costs
+    # a full timeout per unreachable unit (measured 11.3s on a fleet of four
+    # with three down), which overruns the poll interval and stacks up. So the
+    # frequent path probes only the primary; --all is for the panel and the
+    # devices command, where a pause is acceptable.
+    if "--all" in args and fleet.devices:
+        per = fleet.statuses(timeout=2)
+    elif fleet.devices:
+        d = fleet.devices[0]
+        per = [(d.name, d.ip, d.status(timeout=2))]
+        per += [(x.name, x.ip, None) for x in fleet.devices[1:]]
+    else:
+        per = []
+    live = next((st for _, _, st in per if st), None)
+    col = (live or {}).get("color", {}) or {}
+    out = {
+        "name": cfg.get("name", "Lamp"),
+        "mode": cfg.get("mode", "theme"),
+        "modes": list(MODES),
+        "reachable": bool(live),
+        "devices": [_device_json(n, i, st) for n, i, st in per],
+        "deviceCount": len(fleet.devices),
+        "probedAll": "--all" in args,
+        "on": bool((live or {}).get("onOff", 0)),
+        "brightness": (live or {}).get("brightness", 0),
+        "lamp": rgb_hex((col.get("r", 0), col.get("g", 0), col.get("b", 0))) if live else None,
+        "theme": theme_name(),
+        "themeColor": rgb_hex(theme_color()),
+        "palette": [rgb_hex(c) for c in theme_colors()],
+        "workspaceColors": [rgb_hex(c) for c in distinct_colors()],
+        "mixIndex": int(_num(cfg.get("mix_index", 0), 0)),
+        "mixCount": mix_count(),
+        "mixColors": [rgb_hex(c) for c in mix_colors(max(1, len(fleet.devices)), int(_num(cfg.get("mix_index", 0), 0)))],
+        "effect": daemon_pid() or 0,
+        "gaugeSource": cfg.get("gauge_source", "claude"),
+        "gaugeSources": list(SOURCES),
+        "workspace": active_workspace() or 0,
+        "ambientCycle": _num(cfg.get("ambient_cycle"), AMBIENT_CYCLE_DEFAULT),
+        "ambientCycleMin": AMBIENT_CYCLE_MIN,
+        "ambientCycleMax": AMBIENT_CYCLE_MAX,
+    }
+    print(json.dumps(out))
+    return 0
+
+
+# ---------------------------------------------------------------- bluetooth
+
+
+# The lamp is also a JBL Bluetooth speaker. Its BR/EDR radio only advertises
+# while in pairing mode, entered by holding Play/Pause on the lamp (or from
+# Device Settings in the Govee Home app) -- it cannot be woken over the LAN
+# API. So this waits for it to appear rather than failing fast.
+BT_NAME_RE = re.compile(r"govee|jbl|table lamp", re.I)
+
+
+def _btctl(*args, timeout=30):
+    try:
+        out = subprocess.run(["bluetoothctl", *args], capture_output=True,
+                             text=True, timeout=timeout)
+        return out.stdout + out.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+
+
+def bt_find():
+    for line in _btctl("devices").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0] == "Device" and BT_NAME_RE.search(parts[2]):
+            return parts[1], parts[2].strip()
+    return None
+
+
+def cmd_pair(cfg, args):
+    wait = int(_opt(args, "--wait", 90))
+    _btctl("power", "on")
+    print("Put the lamp into pairing mode: hold Play/Pause until it flashes blue")
+    print("and plays the pairing tone (or Govee Home app -> Device Settings ->")
+    print("Bluetooth pairing). Waiting up to %ds..." % wait)
+    hit = bt_find()
+    end = time.time() + wait
+    while not hit and time.time() < end:
+        _btctl("--timeout", "8", "scan", "on", timeout=20)
+        hit = bt_find()
+    if not hit:
+        print("no Govee/JBL speaker appeared. Is it in pairing mode?")
+        return 1
+    mac, name = hit
+    print("found %s (%s)" % (name, mac))
+    for step in ("pair", "trust", "connect"):
+        out = _btctl(step, mac, timeout=45)
+        ok = "successful" in out.lower() or "already" in out.lower()
+        print("  %-8s %s" % (step, "ok" if ok else (out.strip().splitlines() or ["?"])[-1]))
+    cfg["bt_mac"], cfg["bt_name"] = mac, name
+    save_config(cfg)
+    print("saved bt_mac to %s" % CONFIG)
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+
+
+def _opt(args, flag, default=None):
+    if flag in args:
+        try:
+            return args[args.index(flag) + 1]
+        except IndexError:
+            return default
+    return default
+
+
+def cmd_theme(cfg, args):
+    # A running effect re-reads the palette itself; stepping on it here would
+    # just make two writers fight over the lamp.
+    if daemon_pid() and "--force" not in args:
+        return 0
+    rgb = theme_color()
+    ms = int(_num(_opt(args, "--ms", 900), 900))
+    lamp = Lamp(cfg)
+    if cfg.get("brightness"):
+        lamp.brightness(int(_num(cfg["brightness"], 100)))
+    lamp.fade(rgb, ms)
+    print("theme %s -> %s" % (theme_name(), rgb_hex(rgb)))
+    return 0
+
+
+def cmd_color(cfg, args):
+    if not args:
+        print("usage: govee-lamp color '#rrggbb' [--ms N]", file=sys.stderr)
+        return 2
+    stop_daemon(quiet=True)
+    lamp = Lamp(cfg)
+    lamp.fade(hex_rgb(args[0]), int(_num(_opt(args, "--ms", 600), 600)))
+    print("-> %s" % rgb_hex(hex_rgb(args[0])))
+    return 0
+
+
+def cmd_brightness(cfg, args):
+    if not args:
+        print("usage: govee-lamp brightness 0-100", file=sys.stderr)
+        return 2
+    Lamp(cfg).brightness(int(args[0]), force=True)
+    print("brightness %s" % args[0])
+    return 0
+
+
+def cmd_power(cfg, on):
+    if not on:
+        stop_daemon(quiet=True)
+    Lamp(cfg).power(on)
+    print("turned %s" % ("on" if on else "off"))
+    return 0
+
+
+def cmd_discover(cfg, args):
+    hits = discover(cfg, timeout=6)
+    if not hits:
+        print("no Govee devices answered the LAN API.")
+        print("Check LAN Control in the Govee Home app, and that ufw allows")
+        print("udp/4002 in from the LAN (replies are dropped otherwise).")
+        return 1
+    for ip, info in hits.items():
+        print("%-15s %s %s" % (ip, info.get("sku", "?"), info.get("device", "")))
+    return 0
+
+
+def cmd_status(cfg, args):
+    lamp = Lamp(cfg)
+    pid = daemon_pid()
+    print("devices       : %d" % len(lamp.devices))
+    print("theme         : %s" % theme_name())
+    print("theme colour  : %s" % rgb_hex(theme_color()))
+    print("palette       : %s" % " ".join(rgb_hex(c) for c in theme_colors()))
+    print("effect        : %s" % ("running (pid %d)" % pid if pid else "none"))
+    ok = False
+    for name, ip, st in lamp.statuses(timeout=2):
+        if st:
+            ok = True
+            c = st.get("color", {})
+            print("  %-18s %-15s %s  on=%s brightness=%s" % (
+                name, ip, rgb_hex((c.get("r", 0), c.get("g", 0), c.get("b", 0))),
+                st.get("onOff"), st.get("brightness")))
+        else:
+            print("  %-18s %-15s SILENT (LAN Control off, wrong ip, or ufw udp/4002)"
+                  % (name, ip))
+    return 0 if ok else 1
+
+
+USAGE = """usage: govee-lamp <command>
+
+  theme [--ms N]           fade to the current Omarchy theme colour
+  color '#rrggbb' [--ms N] fade to an explicit colour
+  brightness 0-100         set brightness
+  on | off                 power
+
+effects (one at a time; each follows theme changes live)
+  mix [next|prev|N]                   which set of theme colours the fleet wears
+  ambient [--cycle S]                 fade around the whole theme palette,
+                                      one full lap every S seconds (5-60)
+  gauge [--source S] [--pulse]        lamp as a meter: theme colour -> red
+                                      sources: %s
+  workspace                           one theme colour per Hyprland workspace,
+                                      switched off the compositor's event socket
+  circadian                           follow the sun along the theme's own
+                                      cool-to-warm colours; dims after sunset
+  weather                             outside temperature on that same axis,
+                                      dimmed by cloud cover (open-meteo, keyless)
+  events                              rest on the theme colour, tint only when
+                                      something happens
+  music [--rainbow] [--gain N]        react to what the JBL speaker is playing
+  stop                                stop the running effect
+
+  mode <name>                         set the persistent mode driven by the
+                                      plugin and the systemd unit
+  flash ok|warn|fail|info             ring the events effect from a script
+  gauge-source <name>                 what the gauge measures
+  ambient-cycle <seconds>             seconds per full lap of the palette
+
+  pair [--wait N]          pair the lamp's JBL speaker over Bluetooth
+  devices [scan|enable X|disable X]
+                           list the fleet, or add every unit answering on the LAN
+  discover                 find Govee devices answering the LAN API
+  status                   config, palette, running effect, live lamp state
+""" % ", ".join(SOURCES)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cfg = load_config()
+    cmd, args = argv[0], argv[1:]
+    table = {
+        "theme": lambda: cmd_theme(cfg, args),
+        "color": lambda: cmd_color(cfg, args),
+        "colour": lambda: cmd_color(cfg, args),
+        "brightness": lambda: cmd_brightness(cfg, args),
+        "on": lambda: cmd_power(cfg, True),
+        "off": lambda: cmd_power(cfg, False),
+        "ambient": lambda: cmd_ambient(cfg, args),
+        "workspace": lambda: cmd_workspace(cfg, args),
+        "mix": lambda: cmd_mix(cfg, args),
+        "mix-mode": lambda: cmd_mix_mode(cfg, args),
+        "circadian": lambda: cmd_circadian(cfg, args),
+        "weather": lambda: cmd_weather(cfg, args),
+        "events": lambda: cmd_events(cfg, args),
+        "flash": lambda: cmd_flash(cfg, args),
+        "mode": lambda: cmd_mode(cfg, args),
+        "run": lambda: cmd_run(cfg, args),
+        "json": lambda: cmd_json(cfg, args),
+        "gauge-source": lambda: cmd_gauge_source(cfg, args),
+        "ambient-cycle": lambda: cmd_ambient_cycle(cfg, args),
+        "gauge": lambda: cmd_status_fx(cfg, args),
+        "music": lambda: cmd_music(cfg, args),
+        "stop": lambda: 0 if stop_daemon() else 1,
+        "pair": lambda: cmd_pair(cfg, args),
+        "discover": lambda: cmd_discover(cfg, args),
+        "status": lambda: cmd_status(cfg, args),
+        "devices": lambda: cmd_devices(cfg, args),
+    }
+    if cmd not in table:
+        print(USAGE, file=sys.stderr)
+        return 2
+    return table[cmd]()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

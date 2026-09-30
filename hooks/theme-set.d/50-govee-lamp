@@ -1,0 +1,19 @@
+#!/bin/bash
+# Keep the Govee Table Lamp 2 Pro ("Office Light") in step with the Omarchy theme.
+#
+# The lamp speaks the Govee LAN API over plain UDP, so this is a local, cloudless
+# fire-and-forget packet: no account, no key, nothing to block the theme switch.
+# LAN Control must be ON for the device in the Govee Home app or the lamp
+# silently ignores it -- which is exactly the failure mode we want here, since a
+# dark lamp must never hold up a theme change.
+#
+# Fired by: omarchy-hook theme-set "$THEME_NAME"
+# Added 2026-09-18.
+
+LAMP=/home/pi/Projects/lamplight.omarchy/bin/govee-lamp
+[[ -x $LAMP ]] || exit 0
+
+# Detached and silent: the theme switch does not wait on the network.
+setsid "$LAMP" theme >/dev/null 2>&1 </dev/null &
+
+exit 0

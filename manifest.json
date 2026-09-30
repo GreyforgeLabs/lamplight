@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "nixfred.lamplight",
+  "name": "Lamplight",
+  "version": "1.0.0",
+  "author": "nixfred",
+  "license": "MIT",
+  "description": "Drives a Govee lamp from the desktop over the local network. The lamp always wears the active Omarchy theme — there is no colour picker by design — and chooses only what it is DOING: resting on the theme, drifting its palette, following the sun, showing the weather, flashing on events, reacting to music, or acting as a meter.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Lamplight",
+    "description": "A lit dot in the lamp's real colour, read back from the lamp itself. Click for modes, brightness and power.",
+    "category": "Home",
+    "aliases": ["lamp", "govee", "light", "lamplight", "desk"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSec": 5,
+      "showMode": true,
+      "glow": true
+    },
+    "schema": [
+      {
+        "key": "refreshSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often the lamp is asked what colour it is actually showing. Each poll is one UDP round trip on the LAN.",
+        "min": 2,
+        "max": 120,
+        "defaultValue": 5
+      },
+      {
+        "key": "showMode",
+        "type": "boolean",
+        "label": "Show the mode letter",
+        "description": "A single letter beside the dot for the running mode. Off leaves just the dot.",
+        "defaultValue": true
+      },
+      {
+        "key": "glow",
+        "type": "boolean",
+        "label": "Glow halo",
+        "description": "A soft halo around the dot in the lamp's colour. Turn off to save a little GPU.",
+        "defaultValue": true
+      }
+    ]
+  },
+  "repository": "https://github.com/nixfred/lamplight",
+  "homepage": "https://nixfred.com"
+}
