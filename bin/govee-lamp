@@ -1743,7 +1743,7 @@ def lava_frame(lamp, sets, t, period):
                     x = (i % per) / per
                     tower = i // per
                     c = at(roll + phase + tower * 0.5 + x)
-                    blob = 0.4 + 0.6 * math.sin(
+                    blob = 0.9 + 0.1 * math.sin(
                         2 * math.pi * (x * 1.5 - t / (period * 0.6)) + tower * 2.1)
                     frame.append(scale(c, blob))
                 d.segment_colors(frame)
