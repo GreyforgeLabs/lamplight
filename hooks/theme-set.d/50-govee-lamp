@@ -10,7 +10,8 @@
 # Fired by: omarchy-hook theme-set "$THEME_NAME"
 # Added 2026-09-18.
 
-LAMP=/home/pi/Projects/lamplight.omarchy/bin/govee-lamp
+# install.sh rewrites this to point at your checkout.
+LAMP="${LAMPLIGHT_DIR:-$HOME/.config/omarchy/plugins/nixfred.lamplight}/bin/govee-lamp"
 [[ -x $LAMP ]] || exit 0
 
 # Detached and silent: the theme switch does not wait on the network.

@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#7aa2f7"/>
+    </marker>
+    <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3d4f70"/>
+    </marker>
+    <style>
+      .t{font-family:JetBrains Mono,DejaVu Sans Mono,monospace}
+      .h{font-size:15px;fill:#d1e2ff;font-weight:700}
+      .s{font-size:12px;fill:#7f93b5}
+      .l{font-size:12px;fill:#7aa2f7}
+      .box{fill:#111a2b;stroke:#26344f;stroke-width:1.5;rx:10}
+    </style>
+  </defs>
+  <rect width="1280" height="560" fill="#0a0e16"/>
+  <text class="t h" x="40" y="44" font-size="19">Lamplight: what drives what</text>
+
+  <!-- inputs -->
+  <text class="t s" x="40" y="86">TRIGGERS</text>
+  <g>
+    <rect class="box" x="40" y="100" width="250" height="62"/>
+    <text class="t h" x="58" y="126">theme-set hook</text>
+    <text class="t s" x="58" y="146">fires on every Omarchy theme change</text>
+
+    <rect class="box" x="40" y="176" width="250" height="62"/>
+    <text class="t h" x="58" y="202">bar widget</text>
+    <text class="t s" x="58" y="222">polls json, sends mode / brightness</text>
+
+    <rect class="box" x="40" y="252" width="250" height="62"/>
+    <text class="t h" x="58" y="278">foot pedal</text>
+    <text class="t s" x="58" y="298">left: mix next &#183; right: workspace</text>
+
+    <rect class="box" x="40" y="328" width="250" height="62"/>
+    <text class="t h" x="58" y="354">Hyprland events</text>
+    <text class="t s" x="58" y="374">workspace mode, via socket2</text>
+
+    <rect class="box" x="40" y="404" width="250" height="62"/>
+    <text class="t h" x="58" y="430">systemd user unit</text>
+    <text class="t s" x="58" y="450">runs the persisted mode at login</text>
+  </g>
+
+  <!-- engine -->
+  <rect x="400" y="100" width="330" height="366" rx="10" fill="#0f1930" stroke="#33507e" stroke-width="1.5"/>
+  <text class="t h" x="424" y="134" font-size="17">bin/govee-lamp</text>
+  <text class="t s" x="424" y="156">one process owns the lights (flock)</text>
+
+  <g>
+    <rect x="424" y="178" width="282" height="52" rx="8" fill="#152340" stroke="#2b3d5e"/>
+    <text class="t h" x="442" y="200">theme palette</text>
+    <text class="t s" x="442" y="219">colors.toml &#8594; Lab-spread ordering</text>
+
+    <rect x="424" y="242" width="282" height="52" rx="8" fill="#152340" stroke="#2b3d5e"/>
+    <text class="t h" x="442" y="264">mode</text>
+    <text class="t s" x="442" y="283">mix / workspace / ambient / gauge</text>
+
+    <rect x="424" y="306" width="282" height="52" rx="8" fill="#152340" stroke="#2b3d5e"/>
+    <text class="t h" x="442" y="328">effect loop</text>
+    <text class="t s" x="442" y="347">20 updates/sec ceiling, clock-paced</text>
+
+    <rect x="424" y="370" width="282" height="72" rx="8" fill="#152340" stroke="#2b3d5e"/>
+    <text class="t h" x="442" y="392">fleet group</text>
+    <text class="t s" x="442" y="411">fans one call to every device; a</text>
+    <text class="t s" x="442" y="429">fade is paced ONCE, all land together</text>
+  </g>
+
+  <!-- devices -->
+  <text class="t s" x="850" y="86">DEVICES (Govee LAN API)</text>
+  <g>
+    <rect class="box" x="850" y="100" width="180" height="58"/>
+    <circle cx="880" cy="129" r="13" fill="#7aa2f7"/>
+    <text class="t h" x="904" y="126">Lamp 1</text><text class="t s" x="904" y="144">H6020</text>
+
+    <rect class="box" x="850" y="172" width="180" height="58"/>
+    <circle cx="880" cy="201" r="13" fill="#bb9af7"/>
+    <text class="t h" x="904" y="198">Lamp 2</text><text class="t s" x="904" y="216">H6020</text>
+
+    <rect class="box" x="850" y="244" width="180" height="58"/>
+    <rect x="872" y="256" width="16" height="34" rx="8" fill="#9ece6a"/>
+    <text class="t h" x="904" y="270">Bar L</text><text class="t s" x="904" y="288">H6056</text>
+
+    <rect class="box" x="850" y="316" width="180" height="58"/>
+    <rect x="872" y="328" width="16" height="34" rx="8" fill="#ff9e64"/>
+    <text class="t h" x="904" y="342">Bar R</text><text class="t s" x="904" y="360">H6056</text>
+  </g>
+
+  <!-- wires -->
+  <g stroke="#3d4f70" stroke-width="1.6" fill="none" marker-end="url(#b)">
+    <path d="M290 131 H400"/><path d="M290 207 H400"/><path d="M290 283 H400"/>
+    <path d="M290 359 H400"/><path d="M290 435 H400"/>
+  </g>
+  <g stroke="#7aa2f7" stroke-width="1.8" fill="none" marker-end="url(#a)">
+    <path d="M730 283 H790 V129 H850"/>
+    <path d="M730 283 H790 V201 H850"/>
+    <path d="M730 283 H790 V273 H850"/>
+    <path d="M730 283 H790 V345 H850"/>
+  </g>
+  <text class="t l" x="742" y="272">UDP 4003</text>
+
+  <!-- reply path -->
+  <path d="M940 374 V404 H770 V284 H730" stroke="#4a5c7a" stroke-width="1.4" fill="none"
+        stroke-dasharray="5 4" marker-end="url(#b)"/>
+  <text class="t s" x="790" y="424">replies: UDP 4002</text>
+  <text class="t s" x="790" y="442">a default-deny firewall</text>
+  <text class="t s" x="790" y="460">eats these silently</text>
+
+  <text class="t s" x="40" y="516">Everything is animated from this host: the hardware renders one colour at a time, so fades, mixes and</text>
+  <text class="t s" x="40" y="534">workspace changes are all driven here at 20 updates/sec. No cloud, no account, no Govee API key.</text>
+</svg>

@@ -1,5 +1,7 @@
 # Lamplight
 
+![Lamplight](docs/banner.png)
+
 Drive a fleet of Govee lights from Omarchy: an Omarchy bar plugin plus the
 `govee-lamp` CLI that does the work. One repo, because `omarchy plugin add`
 clones a repo and makes it the plugin directory, so the engine ships with the
@@ -20,6 +22,10 @@ omarchy plugin add https://github.com/nixfred/lamplight
 The widget works as soon as the plugin is added, because it calls
 `bin/govee-lamp` relative to itself. `install.sh` additionally puts the CLI on
 your PATH, wires the theme-change hook and installs the background effect unit.
+
+## How it fits together
+
+![architecture](docs/architecture.png)
 
 ## Layout
 
@@ -56,7 +62,7 @@ govee-lamp devices disable "Bar R" # keep it configured, stop driving it
 4. Rename the entry in the config if you want something friendlier.
 
 No firewall change is needed: the ufw rule is subnet scoped
-(`from 10.0.0.0/24 to any port 4002`), so new units are already covered.
+(`from <your-lan>/24 to any port 4002`), so new units are already covered.
 
 ### Two performance rules learned the hard way
 
@@ -214,10 +220,10 @@ fresh flow, so conntrack does not class it as RELATED) is dropped by
 Fixed with:
 
 ```
-sudo ufw allow from 10.0.0.0/24 to any port 4002 proto udp comment 'Govee LAN API replies'
+sudo ufw allow from <your-lan>/24 to any port 4002 proto udp comment 'Govee LAN API replies'
 ```
 
-Diagnose it with `nmap -sU -p 4001,4002,4003 10.0.0.158`: ports 4001/4003
+Diagnose it with `nmap -sU -p 4001,4002,4003 <lamp-ip>`: ports 4001/4003
 `open|filtered` mean the lamp *is* listening and the problem is on this end.
 
 

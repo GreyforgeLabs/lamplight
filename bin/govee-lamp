@@ -7,7 +7,7 @@ Commands go to the lamp on port 4003; the lamp answers on our port 4002.
 Two things must be true or the lamp looks dead:
   * LAN Control is ON for the device in the Govee Home app.
   * ufw lets replies in:
-      ufw allow from 10.0.0.0/24 to any port 4002 proto udp
+      ufw allow from <your-lan>/24 to any port 4002 proto udp
 
 The lamp renders ONE colour at a time -- per-segment writes (0x33 05 15) are
 accepted and then flattened -- so every effect here is animated from this host.
@@ -1009,9 +1009,11 @@ def sun_times(cfg):
     Keyless and free -- the same service the Omarchy weather plugin uses.
     Falls back to a plain 7am/7pm if the network is not there.
     """
-    lat = cfg.get("latitude", 33.749)
-    lon = cfg.get("longitude", -84.388)
+    lat, lon = cfg.get("latitude"), cfg.get("longitude")
     cache = os.path.join(STATE_DIR, "sun.json")
+    if lat is None or lon is None:
+        # No location configured. Circadian still works on a plain 7am/7pm.
+        return 7.0, 19.0
     try:
         st = os.stat(cache)
         if time.time() - st.st_mtime < 6 * 3600:
@@ -1076,8 +1078,9 @@ def weather_now(cfg):
             return json.load(open(cache))
     except (OSError, ValueError):
         pass
-    lat = cfg.get("latitude", 33.749)
-    lon = cfg.get("longitude", -84.388)
+    lat, lon = cfg.get("latitude"), cfg.get("longitude")
+    if lat is None or lon is None:
+        return None
     try:
         url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
                "&current=temperature_2m,weather_code,cloud_cover"
@@ -1095,6 +1098,10 @@ def cmd_weather(cfg, args):
     """Outside temperature as a position on the theme's cool-to-warm axis."""
     claim()
     lamp = Lamp(cfg)
+    if cfg.get("latitude") is None or cfg.get("longitude") is None:
+        print("weather needs a location: set latitude and longitude in %s"
+              % CONFIG, file=sys.stderr)
+        return 2
     cold = _num(_opt(args, "--cold", 35), 35)
     hot = _num(_opt(args, "--hot", 95), 95)
     last = None

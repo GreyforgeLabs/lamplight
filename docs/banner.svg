@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e16"/><stop offset="60%" stop-color="#0d1320"/><stop offset="100%" stop-color="#141b2d"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="16" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="360" fill="url(#bg)"/>
+  <g stroke="#1b2740" stroke-width="1" opacity=".55">
+    <path d="M0 90.5H1280M0 180.5H1280M0 270.5H1280"/>
+    <path d="M320.5 0V360M640.5 0V360M960.5 0V360"/>
+  </g>
+
+  <!-- the four devices, each wearing a different colour of one real theme (tokyo-night) -->
+  <g filter="url(#glow)">
+    <!-- lamp 1 -->
+    <ellipse cx="963" cy="176" rx="42" ry="53" fill="#7aa2f7" opacity=".92"/>
+    <rect x="945" y="226" width="36" height="13" rx="6" fill="#7aa2f7" opacity=".55"/>
+    <!-- lamp 2 -->
+    <ellipse cx="1068" cy="176" rx="42" ry="53" fill="#bb9af7" opacity=".92"/>
+    <rect x="1050" y="226" width="36" height="13" rx="6" fill="#bb9af7" opacity=".55"/>
+    <!-- bar L -->
+    <rect x="1156" y="110" width="24" height="132" rx="12" fill="#9ece6a" opacity=".92"/>
+    <!-- bar R -->
+    <rect x="1212" y="110" width="24" height="132" rx="12" fill="#ff9e64" opacity=".92"/>
+  </g>
+
+  <g font-family="JetBrains Mono, DejaVu Sans Mono, monospace">
+    <text x="84" y="150" font-size="72" font-weight="700" fill="#d1e2ff" letter-spacing="6">LAMPLIGHT</text>
+    <text x="88" y="196" font-size="21" fill="#7aa2f7" letter-spacing="2">Govee lights that wear your Omarchy theme</text>
+    <text x="88" y="232" font-size="16" fill="#5f7599">no colour picker by design &#183; local UDP, no cloud</text>
+  </g>
+
+  <!-- the theme palette the colours above are drawn from -->
+  <g filter="url(#soft)">
+    <rect x="88"  y="276" width="108" height="10" rx="5" fill="#7aa2f7"/>
+    <rect x="204" y="276" width="108" height="10" rx="5" fill="#bb9af7"/>
+    <rect x="320" y="276" width="108" height="10" rx="5" fill="#9ece6a"/>
+    <rect x="436" y="276" width="108" height="10" rx="5" fill="#ff9e64"/>
+    <rect x="552" y="276" width="108" height="10" rx="5" fill="#f7768e"/>
+    <rect x="668" y="276" width="108" height="10" rx="5" fill="#0db9d7"/>
+  </g>
+  <text x="88" y="312" font-family="JetBrains Mono, DejaVu Sans Mono, monospace" font-size="13" fill="#4a5c7a">theme palette &#8594; one colour per device, chosen to sit together</text>
+  <g font-family="JetBrains Mono, DejaVu Sans Mono, monospace" font-size="12" fill="#5f7599" text-anchor="middle">
+    <text x="963" y="266">lamp</text><text x="1068" y="266">lamp</text>
+    <text x="1168" y="266">bar</text><text x="1224" y="266">bar</text>
+  </g>
+</svg>
