@@ -53,6 +53,7 @@ Panel {
     owner: panel.widget
     bar: panel.widget.bar
     open: panel.opened
+    onOpenChanged: if (open && panel.svc) panel.svc.refreshFleet()
     focusTarget: keyCatcher
     contentWidth: kpanel.fittedContentWidth(panel.panelWidth)
     // Never a Flickable in here: the cap is the screen, and everything inside
@@ -372,6 +373,66 @@ Panel {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: if (svc) svc.flash(modelData)
+              }
+            }
+          }
+        }
+
+        Rectangle { Layout.fillWidth: true; height: 1; color: panel.faint; border.width: 0 }
+
+        // ------------------------------------------------------ fleet
+        // One chip per unit on one line, so a fleet of three costs no height.
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(10)
+
+          Text {
+            text: "Fleet"
+            color: panel.dim
+            font.family: panel.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Repeater {
+            model: svc ? svc.devices : []
+            delegate: Rectangle {
+              required property var modelData
+              Layout.fillWidth: true
+              implicitHeight: chipRow.implicitHeight + Style.space(10)
+              radius: Style.space(6)
+              color: panel.faint
+              border.width: 0
+
+              RowLayout {
+                id: chipRow
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                Rectangle {
+                  width: Style.space(10); height: width; radius: width / 2
+                  border.width: 0
+                  color: modelData.reachable && modelData.on && modelData.color
+                         ? modelData.color : Util.alpha(panel.foreground, 0.3)
+                  Behavior on color { ColorAnimation { duration: 400 } }
+                }
+                Text {
+                  text: modelData.name
+                  color: panel.foreground
+                  font.family: panel.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+                Item { Layout.fillWidth: true }
+                Text {
+                  text: modelData.reachable
+                        ? (modelData.on ? modelData.brightness + "%" : "off")
+                        : modelData.ip
+                  color: panel.dim
+                  font.family: panel.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
               }
             }
           }

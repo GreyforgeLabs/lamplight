@@ -39,6 +39,9 @@ Item {
   property real ambientCycleMax: 60
   property var gaugeSources: []
   property int effectPid: 0
+  // Per-device state. The frequent poll probes only the primary, so the full
+  // fleet is only believed from a --all probe (run when the panel opens).
+  property var devices: []
 
   readonly property int refreshSec: {
     var n = parseInt(String(settings && settings.refreshSec !== undefined ? settings.refreshSec : 5), 10)
@@ -71,6 +74,8 @@ Item {
     if (d.ambientCycleMax) ambientCycleMax = d.ambientCycleMax
     gaugeSources = d.gaugeSources || []
     effectPid = d.effect || 0
+    if (Array.isArray(d.devices) && (d.probedAll || devices.length !== d.devices.length))
+      devices = d.devices
     ready = true
   }
 
@@ -116,6 +121,17 @@ Item {
     // Give the CLI a moment to act before believing the next poll.
     settle.restart()
   }
+
+  Process {
+    id: fleetPoll
+    command: [root.cli, "json", "--all"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.apply(text)
+    }
+  }
+
+  function refreshFleet() { if (!fleetPoll.running) fleetPoll.running = true }
 
   function refresh() { if (!poll.running) poll.running = true }
 
