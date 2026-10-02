@@ -1598,60 +1598,84 @@ def scene_lamps_to(cfg, lamp, want):
 
 
 # Hand-picked Govee scenes per Omarchy theme, by mood as much as by colour:
-# (lamp H6020 scenes, light bar H6056 scenes). Bar picks are slow, flowing
+# (6 lamp H6020 scenes, 6 light bar H6056 scenes). Bar picks are slow, flowing
 # scenes only: Fred wants the bars moving but never flashing (2026-10-01).
 # Lava mode rotates each unit
 # through its list every `scene_rotate` minutes. A theme not listed here
 # falls back to the colour-nearest lamp scene and the theme lava on the bars.
 THEME_SCENES = {
-    "2-haxorz":     (["Interstellar Voyage", "Neon City", "Meteor"],
-                     ["Nebula", "Universe", "Stream"]),
-    "catppuccin":   (["Dreamland", "Cherry blossoms", "Falling Petals"],
-                     ["Dreamlike", "Sweet", "Peach"]),
-    "catppuccin-latte": (["Spring", "Flower Field", "Cherry blossoms"],
-                     ["Tenderness", "Bloom", "Sweet"]),
-    "ethereal":     (["Aurora", "Floating Mist", "Healing"],
-                     ["Aurora", "Meditation", "Dreamlike"]),
-    "everforest":   (["Mountain Forest", "Weeping Willow", "Firefly"],
-                     ["Grassland", "Lush", "Herbal"]),
-    "flexoki-light": (["Morning", "Afternoon", "Sunny"],
-                     ["Mild", "Cornfield", "Clear Sky"]),
-    "gruvbox":      (["Fall", "Desert", "Sunset Glow"],
-                     ["Fall", "Cornfield", "Desert B"]),
-    "hackerman":    (["Star Train", "Neon City", "Meteorite"],
-                     ["Stream", "Universe", "Nebula"]),
-    "kanagawa":     (["Deep sea", "Waterfall", "Moonlight"],
-                     ["Deep sea", "Quiet", "Stream"]),
-    "last-horizon": (["Sunset", "Interstellar Voyage", "Milky Way"],
-                     ["Sunset Glow", "Universe", "Nebula"]),
-    "lumon":        (["Morning Mist", "Glacier", "Refreshing"],
-                     ["Clear Sky", "Glacier", "Mild"]),
-    "lupine":       (["Flower Field", "Dreamland", "Spritual"],
-                     ["Berry", "Bloom", "Dreamlike"]),
-    "matte-black":  (["Night", "Moonlight", "Karst Cave"],
-                     ["Quiet", "Asleep", "Soothing"]),
-    "miasma":       (["Ghost", "Karst Cave", "Firefly"],
-                     ["Herbal", "Cloudy", "Lush"]),
-    "nord":         (["Glacier", "Accumulated Snow", "Winter"],
-                     ["Glacier", "Winter", "Clear Sky"]),
-    "osaka-jade":   (["Lake", "Spring Wind", "Fish tank"],
-                     ["Lush", "Stream", "Grassland"]),
-    "retro-82":     (["Carnival", "Dance Party", "Neon City"],
-                     ["Rainbow", "Seasonal", "Summer"]),
-    "ristretto":    (["Warm", "Sunset Glow", "Desert"],
-                     ["Desert B", "Sunset Glow", "Fall"]),
-    "rose-pine":    (["Sunset", "Cherry blossoms", "Dreamland"],
-                     ["Romantic", "Peach", "Dreamlike"]),
-    "solitude":     (["Moonlight Sprinkles", "Sleeping", "Night"],
-                     ["Soothing", "Quiet", "Asleep"]),
-    "synthwave":    (["Dance Party", "Neon City", "Milky Way"],
-                     ["Universe", "Nebula", "Rainbow"]),
-    "tokyo-night":  (["Neon City", "Night", "Moonlight"],
-                     ["Meditation", "Deep sea", "Universe"]),
-    "vantablack":   (["Meteorite", "Night", "Moonlight"],
-                     ["Asleep", "Quiet", "Universe"]),
-    "white":        (["Morning", "Sky", "Refreshing"],
-                     ["Mild", "Clear Sky", "Tenderness"]),
+    "2-haxorz": (
+        ["Interstellar Voyage", "Neon City", "Meteor", "Starry Sky", "Rhomb", "Uranus"],
+        ["Nebula", "Universe", "Stream", "Meditation", "Thick Fog", "Deep sea"]),
+    "catppuccin": (
+        ["Dreamland", "Cherry blossoms", "Falling Petals", "Feather", "Healing", "Venus"],
+        ["Dreamlike", "Sweet", "Peach", "Berry", "Tenderness", "Bloom"]),
+    "catppuccin-latte": (
+        ["Spring", "Flower Field", "Cherry blossoms", "Morning", "Watermelon", "Sunny"],
+        ["Tenderness", "Bloom", "Sweet", "Peach", "Spring", "Mild"]),
+    "ethereal": (
+        ["Aurora", "Floating Mist", "Healing", "Spritual", "Starry Sky", "Feather"],
+        ["Aurora", "Meditation", "Dreamlike", "Nebula", "Soothing", "Thick Fog"]),
+    "everforest": (
+        ["Mountain Forest", "Weeping Willow", "Firefly", "Forest", "Spring", "Lake"],
+        ["Grassland", "Lush", "Herbal", "Spring", "Cornfield", "Windy Day"]),
+    "flexoki-light": (
+        ["Morning", "Afternoon", "Sunny", "Reading", "Sky", "Dawn"],
+        ["Mild", "Cornfield", "Clear Sky", "Literary", "Sunny", "Cloudy Day"]),
+    "gruvbox": (
+        ["Fall", "Desert", "Sunset Glow", "Warm", "Fire", "Mars"],
+        ["Fall", "Cornfield", "Desert B", "Sand Grains", "Sunset Glow", "Seasonal"]),
+    "hackerman": (
+        ["Star Train", "Neon City", "Meteorite", "Greedy Snake", "Stacking", "Interstellar Voyage"],
+        ["Stream", "Universe", "Nebula", "Lush", "Deep sea", "Meditation"]),
+    "kanagawa": (
+        ["Deep sea", "Waterfall", "Moonlight", "Ocean", "Wave", "Jellyfish"],
+        ["Deep sea", "Quiet", "Stream", "Winter", "Cloudy", "Meditation"]),
+    "last-horizon": (
+        ["Sunset", "Interstellar Voyage", "Starry Sky", "Saturn", "Sunrise", "Earth"],
+        ["Sunset Glow", "Universe", "Nebula", "Summer", "Fall", "Romantic"]),
+    "lumon": (
+        ["Morning Mist", "Glacier", "Refreshing", "Work", "White Light", "Sky"],
+        ["Clear Sky", "Glacier", "Mild", "Cloudy Day", "Snowing", "Quiet"]),
+    "lupine": (
+        ["Flower Field", "Dreamland", "Spritual", "Venus", "Falling Petals", "Healing"],
+        ["Berry", "Bloom", "Dreamlike", "Romantic", "Sweet", "Nebula"]),
+    "matte-black": (
+        ["Night", "Moonlight", "Karst Cave", "Night Light", "Sleeping", "Earth"],
+        ["Quiet", "Asleep", "Soothing", "Meditation", "Thick Fog", "Universe"]),
+    "miasma": (
+        ["Ghost", "Karst Cave", "Firefly", "Smudge", "Halloween", "Forest"],
+        ["Herbal", "Cloudy", "Lush", "Thick Fog", "Grassland", "Windy Day"]),
+    "nord": (
+        ["Glacier", "Accumulated Snow", "Winter", "Snow flake", "Lake", "Morning Mist"],
+        ["Glacier", "Winter", "Clear Sky", "Snowing", "Cloudy", "Quiet"]),
+    "osaka-jade": (
+        ["Lake", "Waterfall", "Fish tank", "Goldfish", "Weeping Willow", "Spring Shower"],
+        ["Lush", "Stream", "Grassland", "Herbal", "Spring", "Deep sea"]),
+    "retro-82": (
+        ["Carnival", "Dance Party", "Neon City", "Rainbow", "Carousel", "Candy Crush"],
+        ["Rainbow", "Seasonal", "Summer", "Sweet", "Peach", "Berry"]),
+    "ristretto": (
+        ["Warm", "Sunset Glow", "Desert", "Fire", "Mars", "Fall"],
+        ["Desert B", "Sunset Glow", "Fall", "Sand Grains", "Cornfield", "Seasonal"]),
+    "rose-pine": (
+        ["Sunset", "Cherry blossoms", "Dreamland", "Romantic", "Venus", "Feather"],
+        ["Romantic", "Peach", "Dreamlike", "Berry", "Tenderness", "Sunset Glow"]),
+    "solitude": (
+        ["Moonlight Sprinkles", "Sleeping", "Night", "Cradle", "Accompany", "Soothing"],
+        ["Soothing", "Quiet", "Asleep", "Meditation", "Mild", "Cloudy"]),
+    "synthwave": (
+        ["Dance Party", "Neon City", "Venus", "Party", "Jupiter", "Rhomb"],
+        ["Universe", "Nebula", "Rainbow", "Romantic", "Sunset Glow", "Berry"]),
+    "tokyo-night": (
+        ["Neon City", "Night", "Moonlight", "Starry Sky", "Saturn", "Train"],
+        ["Meditation", "Deep sea", "Universe", "Nebula", "Stream", "Quiet"]),
+    "vantablack": (
+        ["Meteorite", "Night", "Moonlight", "Uranus", "Jupiter", "Starry Sky"],
+        ["Asleep", "Quiet", "Universe", "Nebula", "Thick Fog", "Deep sea"]),
+    "white": (
+        ["Morning", "Sky", "Refreshing", "White Light", "Reading", "Snow flake"],
+        ["Mild", "Clear Sky", "Tenderness", "White Light", "Snowing", "Cloudy Day"]),
 }
 
 
