@@ -1597,6 +1597,126 @@ def scene_lamps_to(cfg, lamp, want):
             kwargs={"sku": d.sku, "device": d.device_id}).start()
 
 
+# Hand-picked Govee scenes per Omarchy theme, by mood as much as by colour:
+# (lamp H6020 scenes, light bar H6056 scenes). Lava mode rotates each unit
+# through its list every `scene_rotate` minutes. A theme not listed here
+# falls back to the colour-nearest lamp scene and the theme lava on the bars.
+THEME_SCENES = {
+    "2-haxorz":     (["Neon City", "Interstellar Voyage", "Meteor"],
+                     ["Science Fiction", "Tunnel", "Glitter"]),
+    "catppuccin":   (["Dreamland", "Cherry blossoms", "Falling Petals"],
+                     ["Dreamlike", "Sweet", "Peach"]),
+    "catppuccin-latte": (["Spring", "Flower Field", "Cherry blossoms"],
+                     ["Sweet", "Bloom", "Tenderness"]),
+    "ethereal":     (["Aurora", "Floating Mist", "Healing"],
+                     ["Nebula", "Meditation", "Dreamlike"]),
+    "everforest":   (["Mountain Forest", "Weeping Willow", "Firefly"],
+                     ["Grassland", "Lush", "Herbal"]),
+    "flexoki-light": (["Morning", "Afternoon", "Sunny"],
+                     ["Literary", "Reading", "Mild"]),
+    "gruvbox":      (["Fall", "Desert", "Sunset Glow"],
+                     ["Fall", "Candlelight", "Cornfield"]),
+    "hackerman":    (["Neon City", "Star Train", "Meteorite"],
+                     ["Science Fiction", "Tunnel", "Energetic"]),
+    "kanagawa":     (["Deep sea", "Waterfall", "Moonlight"],
+                     ["Deep sea", "Stream", "Quiet"]),
+    "last-horizon": (["Sunset", "Interstellar Voyage", "Milky Way"],
+                     ["Sunset Glow", "Universe", "Nebula"]),
+    "lumon":        (["Glacier", "Morning Mist", "Refreshing"],
+                     ["Glacier", "Clear Sky", "Mild"]),
+    "lupine":       (["Flower Field", "Dreamland", "Spritual"],
+                     ["Berry", "Bloom", "Dreamlike"]),
+    "matte-black":  (["Night", "Moonlight", "Karst Cave"],
+                     ["Candlelight", "Quiet", "Asleep"]),
+    "miasma":       (["Karst Cave", "Ghost", "Firefly"],
+                     ["Fright", "Thick Fog", "Herbal"]),
+    "nord":         (["Glacier", "Accumulated Snow", "Winter"],
+                     ["Snow flake", "Winter", "Glacier"]),
+    "osaka-jade":   (["Lake", "Spring Wind", "Fish tank"],
+                     ["Lush", "Stream", "Grassland"]),
+    "retro-82":     (["Dance Party", "Carnival", "Neon City"],
+                     ["Party", "Colorful", "Rainbow"]),
+    "ristretto":    (["Warm", "Sunset Glow", "Desert"],
+                     ["Candlelight", "Fire", "Desert B"]),
+    "rose-pine":    (["Sunset", "Cherry blossoms", "Dreamland"],
+                     ["Romantic", "Peach", "Dreamlike"]),
+    "solitude":     (["Moonlight Sprinkles", "Sleeping", "Night"],
+                     ["Quiet", "Soothing", "Asleep"]),
+    "synthwave":    (["Neon City", "Dance Party", "Milky Way"],
+                     ["Science Fiction", "Party", "Nebula"]),
+    "tokyo-night":  (["Neon City", "Night", "Moonlight"],
+                     ["Universe", "Nebula", "Tunnel"]),
+    "vantablack":   (["Night", "Meteorite", "Moonlight"],
+                     ["Universe", "Asleep", "Quiet"]),
+    "white":        (["Morning", "Sky", "Refreshing"],
+                     ["White Light", "Clear Sky", "Reading"]),
+}
+
+
+def scene_options(cfg, sku, device):
+    """{scene name: lightScene value} for a SKU, from Govee's cloud, cached.
+
+    Unlike scene_catalog this needs no colour data, so it covers the light
+    bars too, whose scene params are not the PNG frames the lamps use.
+    """
+    path = os.path.join(SCENE_CACHE, "options-%s.json" % sku)
+    try:
+        if time.time() - os.path.getmtime(path) < 7 * 86400:
+            with open(path) as fh:
+                return json.load(fh)
+    except OSError:
+        pass
+    key = os.environ.get("GOVEE_API_KEY") or cfg.get("api_key")
+    if not (key and device):
+        return {}
+    try:
+        body = json.dumps({"requestId": str(uuid.uuid4()),
+                           "payload": {"sku": sku, "device": device}}).encode()
+        req = urllib.request.Request(SCENES_URL, data=body, headers={
+            "Content-Type": "application/json", "Govee-API-Key": key})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            opts = json.load(resp)["payload"]["capabilities"][0]["parameters"]["options"]
+    except Exception as exc:  # noqa: BLE001
+        print("scene options unavailable: %s" % exc, file=sys.stderr)
+        return {}
+    out = {o["name"]: o["value"] for o in opts}
+    if out:
+        os.makedirs(SCENE_CACHE, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(out, fh)
+    return out
+
+
+def theme_scene_step(cfg, lamp, theme, step):
+    """Put every unit on scene `step` of the theme's playlist.
+
+    Returns True when the theme has a playlist (the caller then leaves those
+    units alone), False to fall back to colour matching and lava.
+    """
+    import threading
+    picks = THEME_SCENES.get(theme)
+    if not picks:
+        return False
+    for d in lamp.devices:
+        if not getattr(d, "device_id", None):
+            continue
+        names = picks[1] if d.segments else picks[0]
+        opts = scene_options(cfg, d.sku, d.device_id)
+        names = [n for n in names if n in opts]
+        if not names:
+            continue
+        name = names[step % len(names)]
+        if getattr(d, "scene", None) == name:
+            continue
+        d.scene = name
+        print("scene %s -> %s" % (d.name, name), file=sys.stderr)
+        threading.Thread(target=cloud_control, daemon=True, args=(cfg, {
+            "type": "devices.capabilities.dynamic_scene",
+            "instance": "lightScene", "value": opts[name]}),
+            kwargs={"sku": d.sku, "device": d.device_id}).start()
+    return True
+
+
 def theme_lava_set(cols, k=4):
     """Up to k theme colours, vivid, spread as far apart in hue as it has.
 
@@ -1631,12 +1751,22 @@ def cmd_lava(cfg, args):
     fps = 8.0
     stamp, cur, prev, switched = None, None, None, 0.0
     t0 = time.time()
+    rotate = max(1.0, _num(cfg.get("scene_rotate", 10), 10)) * 60
+    playing, step, stepped = False, 0, 0.0
     while True:
+        if playing and time.time() - stepped >= rotate:
+            step, stepped = step + 1, time.time()
+            theme_scene_step(cfg, lamp, theme_name(), step)
         if theme_stamp() != stamp:
             stamp = theme_stamp()
             prev, cur = cur, theme_lava_set(distinct_colors())
             switched = time.time()
-            if cfg.get("lamp_scenes", True):
+            for d in lamp.devices:
+                d.scene = None
+            step, stepped = 0, time.time()
+            playing = bool(cfg.get("theme_scenes", True)) and \
+                theme_scene_step(cfg, lamp, theme_name(), step)
+            if not playing and cfg.get("lamp_scenes", True):
                 # Real theme colours on the matrix lamps over LAN; any unit we
                 # cannot build a scene for falls back to the nearest stock one.
                 rest = []
@@ -1734,6 +1864,8 @@ def lava_frame(lamp, sets, t, period, cfg_roll=True, bars_set=None):
         phase = idx * 0.37
         try:
             n = d.segments
+            if n and getattr(d, "scene", None):
+                continue  # the bars are playing a Govee scene
             if n:
                 # The H6056 is two towers of n/2 segments; give each tower the
                 # whole colour loop so the band is visible on both, and ride a
