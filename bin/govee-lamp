@@ -437,7 +437,10 @@ class Device:
 
     def _status_locked(self, timeout):
         # Resolve once so hostname configs still match recvfrom's numeric IP.
-        expected_ip = socket.gethostbyname(self.ip)
+        try:
+            expected_ip = socket.gethostbyname(self.ip)
+        except OSError:
+            return None  # unresolvable host reads as unreachable, like a timeout
         rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:

@@ -159,6 +159,12 @@ class TransportTests(unittest.TestCase):
             "127.0.0.2": {**other_scan, "ip": "127.0.0.2"},
         })
 
+    def test_status_unresolvable_host_reads_as_unreachable(self):
+        with patch.object(lamp.socket, "gethostbyname",
+                          side_effect=socket.gaierror("no such host")):
+            self.assertIsNone(self.device.status(timeout=0.05))
+        self.assertEqual(self.requests, [])
+
     def test_discovery_does_not_admit_status_only_sender(self):
         self.respond([(self.server, reply("devStatus", STATUS))])
         self.assertEqual(lamp.discover({}, timeout=0.05), {})
